@@ -99,7 +99,8 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="5dp"
             android:layout_marginBottom="5dp"
-            android:hint="Panel Confirmation Code"
+            android:hint="Participant Code"
+            app:prefixText="TCU-"
             app:boxCornerRadiusBottomEnd="8dp"
             app:boxCornerRadiusBottomStart="8dp"
             app:boxCornerRadiusTopEnd="8dp"
@@ -109,8 +110,9 @@
                 android:id="@+id/loginPanelConfirmationlFragmentEmail"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:digits="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890_-@."
-                android:inputType="textFilter|textVisiblePassword|textNoSuggestions" />
+                android:digits="0123456789"
+                android:inputType="number"
+                android:maxLength="4" />
 
         </com.google.android.material.textfield.TextInputLayout>
 

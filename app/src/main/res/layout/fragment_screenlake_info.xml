@@ -25,7 +25,7 @@
                 android:layout_height="wrap_content"
                 android:fontFamily="@font/inter_black"
                 android:gravity="center"
-                android:text="What is SRK"
+                android:text="What is TCU Screenlake"
                 android:textColor="@color/black"
                 android:textSize="24sp"
                 app:layout_constraintBottom_toBottomOf="parent"
@@ -65,7 +65,7 @@
                     android:layout_height="wrap_content"
                     android:layout_marginStart="10dp"
                     android:layout_marginEnd="20dp"
-                    android:text="How does SRK Work?"
+                    android:text="How does TCU Screenlake Work?"
                     android:textSize="18sp"
                     android:textColor="@color/black"
                     android:fontFamily="@font/inter_semibold"/>

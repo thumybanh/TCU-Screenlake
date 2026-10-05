@@ -2,7 +2,7 @@
   "LambdaFunctionConfigurations": [
     {
       "Id": "unpack-academia-zips",
-      "LambdaFunctionArn": "arn:aws:lambda:us-east-2:REPLACE_ACCOUNT_ID:function:screenlake-unpack-zips",
+      "LambdaFunctionArn": "arn:aws:lambda:us-east-2:951662621099:function:screenlake-unpack-zips",
       "Events": [
         "s3:ObjectCreated:*"
       ],

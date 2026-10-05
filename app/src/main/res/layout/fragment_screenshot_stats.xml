@@ -200,7 +200,7 @@
                         android:visibility="gone"
                         android:layout_marginTop="8dp"
                         android:text="View upload progress"
-                        android:textColor="@android:color/holo_blue_dark"
+                        android:textColor="@color/tcu_purple"
                         android:textAppearance="?attr/textAppearanceBody1" />
 
                 </LinearLayout>

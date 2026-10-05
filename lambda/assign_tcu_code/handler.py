@@ -44,8 +44,14 @@ class HandlerError(RuntimeError):
 
 
 def lambda_handler(event, _context):
-    cognito_sub = _extract(event, "cognito_sub")
-    cognito_username = _extract(event, "cognito_username") or ""
+    # Cognito PostConfirmation trigger shape
+    if "request" in event and "userAttributes" in event.get("request", {}):
+        attrs = event["request"]["userAttributes"]
+        cognito_sub = attrs.get("sub")
+        cognito_username = attrs.get("email") or event.get("userName") or ""
+    else:
+        cognito_sub = _extract(event, "cognito_sub")
+        cognito_username = _extract(event, "cognito_username") or ""
 
     existing = _lookup_existing(cognito_sub)
     if existing is not None:

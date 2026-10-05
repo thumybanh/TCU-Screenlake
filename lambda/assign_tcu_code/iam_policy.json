@@ -9,7 +9,7 @@
         "dynamodb:PutItem",
         "dynamodb:UpdateItem"
       ],
-      "Resource": "arn:aws:dynamodb:us-east-2:842294335158:table/screenlake-tcu-codes"
+      "Resource": "arn:aws:dynamodb:us-east-2:951662621099:table/screenlake-tcu-codes"
     },
     {
       "Sid": "WriteTcuCodeToCognito",
@@ -17,7 +17,7 @@
       "Action": [
         "cognito-idp:AdminUpdateUserAttributes"
       ],
-      "Resource": "arn:aws:cognito-idp:us-east-2:842294335158:userpool/us-east-2_J52HUsGbQ"
+      "Resource": "arn:aws:cognito-idp:us-east-2:951662621099:userpool/us-east-2_5pvOLMS20"
     },
     {
       "Sid": "CloudWatchLogs",

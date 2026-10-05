@@ -42,7 +42,7 @@
         libero vel nunc consequat, quis tincidunt nisl eleifend. Cras bibendum enim a justo luctus
         vestibulum. Fusce dictum libero quis erat maximus, vitae volutpat diam dignissim.
     </string>
-    <string name="app_name">SRK</string>
+    <string name="app_name">TCU Screenlake</string>
     <string name="logout">Logout</string>
     <string name="recorded_apps">Recorded Apps</string>
     <string name="settings">settings</string>
@@ -254,17 +254,17 @@
     <string name="next">Next</string>
     <string name="hold_to_record">Hold to record</string>
     <string name="previous">Previous</string>
-    <!--    <string name="post_api">This app is for demonstration. Spend a minute switching using any other app(s), and then check your device&apos;s &quot;files folder&quot; to see all the screenshots and log data collected from this device so far. You can work with SRK to facilitate this sort of data collection from participants. All data is sent directly to your institution&apos;s cloud server.</string>-->
+    <!--    <string name="post_api">This app is for demonstration. Spend a minute switching using any other app(s), and then check your device&apos;s &quot;files folder&quot; to see all the screenshots and log data collected from this device so far. You can work with TCU Screenlake to facilitate this sort of data collection from participants. All data is sent directly to your institution&apos;s cloud server.</string>-->
     <string name="hello_first_fragment">Hello first fragment</string>
     <string name="hello_second_fragment">Hello second fragment. Arg: %1$s</string>
     <string name="payment">We send money each week via PayPal toy our email address, and we\'ll keep it up as long as we have research to do. (We\'ll notify you if it\'s time to stop recording). Simple as that</string>
-    <string name="screenlake_work">SRK runs in the background, capturing and analyzing your screen behavior. Once it\'s running, you don\'t even have to keep the app open.</string>
-    <string name="privacy">You can pause, restrict, stop, and delete data you upload to us. We stay straightforward. Block SRK from recording apps that you don\'t want recorded. Contact us anytime.</string>
+    <string name="screenlake_work">TCU Screenlake runs in the background, capturing and analyzing your screen behavior. Once it\'s running, you don\'t even have to keep the app open.</string>
+    <string name="privacy">You can pause, restrict, stop, and delete data you upload to us. We stay straightforward. Block TCU Screenlake from recording apps that you don\'t want recorded. Contact us anytime.</string>
 
     <string name="notification_permission_granted">Notification permission granted</string>
     <string name="notification_permission_denied">Notification permission denied</string>
     <string name="notification_permission_not_available">"Notification permission is not available on your device."d</string>
-    <string name="disclaimer">"This app requests that you grant \"Accessibility API permission\". This permission generally enables apps to capture information about the content you see on-screen. This app in particular uses it to capture three specific pieces of information, improving its functionality as a research tool and thus your experience as a research participant. (1) URLs you visit, (2) buttons you tap on, and (3) text you've seen on-screen. In line with the research participation plan you've made with the :ENTER YOUR UNIVERSITY HERE:, and the research consent form they provide you with, your data is used strictly for scientific analysis. The data is not shared with anyone outside of the designated research team."</string>
+    <string name="disclaimer">"This app requests that you grant \"Accessibility API permission\". This permission generally enables apps to capture information about the content you see on-screen. This app in particular uses it to capture three specific pieces of information, improving its functionality as a research tool and thus your experience as a research participant. (1) URLs you visit, (2) buttons you tap on, and (3) text you've seen on-screen. In line with the research participation plan you've made with the Texas Christian University, and the research consent form they provide you with, your data is used strictly for scientific analysis. The data is not shared with anyone outside of the designated research team."</string>
     <string name="offline">Not connected to the internet</string>
     <string name="if_your_account_is_not_confirmed_log_in_normally_with_your_email_and_password_and_your_confirmation_code_will_be_re_sent">. If your account is not confirmed, log in normally with your email and password and your confirmation code will be re-sent.</string>
     <string name="exists">exists</string>
@@ -278,16 +278,16 @@
     <string name="password_must_include_a_number">Password must include a number</string>
     <string name="password_must_include_a_special_character">Password must include a special character</string>
     <string name="password_must_be_8_characters_long">Password must be 8 characters long</string>
-    <string name="for_screenlake_to_work_properly_we_need_you_to_accept_accessibility_settings">For SRK to work properly, we need you to grant Accessibility Settings.</string>
-    <string name="screenlake">SRK</string>
+    <string name="for_screenlake_to_work_properly_we_need_you_to_accept_accessibility_settings">For TCU Screenlake to work properly, we need you to grant Accessibility Settings.</string>
+    <string name="screenlake">TCU Screenlake</string>
     <string name="agree">Agree</string>
-    <string name="are_you_sure_you_want_to_log_out_of_screenlake_this_will_delete_all_user_data_from_the_phone">Are you sure you want to log out of SRK? This will delete all user data from the phone.</string>
+    <string name="are_you_sure_you_want_to_log_out_of_screenlake_this_will_delete_all_user_data_from_the_phone">Are you sure you want to log out of TCU Screenlake? This will delete all user data from the phone.</string>
     <string name="email_cannot_be_empty">Email cannot be empty</string>
     <string name="password_cannot_be_empty">Password cannot be empty</string>
     <string name="login">Login</string>
     <string name="your_login_was_incorrect">Your login was incorrect.</string>
     <string name="logging_in">Logging in...</string>
-    <string name="for_screenlake_to_work_properly_you_must_manually_permit_usage_access_this_is_so_we_can_stop_recording_data_sensitive_apps_for_privacy_reasons">For SRK to work properly, you must manually permit Usage Access. \n This is so we can stop recording data sensitive apps for privacy reasons.</string>
+    <string name="for_screenlake_to_work_properly_you_must_manually_permit_usage_access_this_is_so_we_can_stop_recording_data_sensitive_apps_for_privacy_reasons">For TCU Screenlake to work properly, you must manually permit Usage Access. \n This is so we can stop recording data sensitive apps for privacy reasons.</string>
     <string name="privacy_url">https://screenlake.com/privacy-policy</string>
     <string name="sending">Sending...</string>
     <string name="invalid_code_please_enter_a_4_digit_code_between_0000_and_9999">Invalid code. Please enter a 4-digit code between 0000 and 9999.</string>
@@ -302,8 +302,8 @@
 
     <![CDATA[
     By using this app, you agree to our
-    <a href="https://example.com/terms" style="color:#005cff;">Terms of Service</a>
-    and <a href="https://example.com/privacy" style="color:#005cff;">Privacy Policy</a>.
+    <a href="https://example.com/terms" style="color:#4d1979;">Terms of Service</a>
+    and <a href="https://example.com/privacy" style="color:#4d1979;">Privacy Policy</a>.
     ]]>
 
     </string>
@@ -317,6 +317,6 @@
     <string name="confirmation_failed_badly_formatted_code">Confirmation failed, badly formatted code.</string>
     <string name="grant_access">Grant Access?</string>
     <string name="please_re_enable_screen_recording">Please re-enable screen recording.</string>
-    <string name="screenlake_is_using_the_accessibility_service_to_record_your_screen_in_the_background">SRK is using the accessibility service to record your screen in the background</string>
+    <string name="screenlake_is_using_the_accessibility_service_to_record_your_screen_in_the_background">TCU Screenlake is using the accessibility service to record your screen in the background</string>
     <string name="_00_00_00">00:00:00</string>
 </resources>
