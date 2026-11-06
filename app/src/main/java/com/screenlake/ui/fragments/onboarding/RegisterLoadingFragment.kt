@@ -48,9 +48,18 @@ class RegisterLoadingFragment : Fragment() {
         isConfirmed.removeObservers(viewLifecycleOwner)
         val userName = UUID.randomUUID().toString()
         amplifyRepository.username = userName
+        // Do NOT persist the typed signup code locally. The typed code is only
+        // used server-side (PreSignUp Lambda) to validate that the participant
+        // is on the researcher's pre-reservation list. The code that actually
+        // identifies the participant in all upload paths is the TCU code
+        // assigned by the PostConfirmation Lambda, which lives on the Cognito
+        // user as the `custom:tcu_code` attribute. We fetch it after sign-in
+        // and populate `user.emailHash` from that attribute — never from what
+        // the participant typed. This prevents an incorrect typed code from
+        // ever reaching S3 as a `panelist/<code>/` path.
         val user = UserEntity(
             email = amplifyRepository.email,
-            emailHash = amplifyRepository.code,
+            emailHash = null,
             model = BaseUtility.getDeviceName(),
             sdk = Build.VERSION.SDK,
             device = Build.DEVICE,

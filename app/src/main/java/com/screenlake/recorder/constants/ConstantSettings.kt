@@ -42,7 +42,7 @@ object ConstantSettings {
         20.0 to 50L,
         30.0 to 33L
     )
-    const val SCREENSHOT_IMAGE_QUALITY = 50
+    const val SCREENSHOT_IMAGE_QUALITY = 45
 
     const val NOTIFICATION_CHANNEL_ID = "recording_channel"
     const val NOTIFICATION_CHANNEL_NAME = "Tracking"

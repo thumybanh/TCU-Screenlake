@@ -29,7 +29,14 @@ import com.screenlake.recorder.utilities.PermissionHelper
 import com.screenlake.recorder.viewmodels.MainViewModel
 import com.screenlake.recorder.viewmodels.RestrictedAppViewModel
 import com.screenlake.ui.fragments.ScreenRecordFragment
+import com.screenlake.data.UserRolePrefs
+import com.screenlake.data.database.dao.UserDao
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import androidx.lifecycle.lifecycleScope
+import javax.inject.Inject
 import timber.log.Timber
 
 @AndroidEntryPoint
@@ -40,6 +47,20 @@ class MainActivity : AppCompatActivity(), ScreenRecordFragment.MediaProjectionCa
     private val viewModel: RestrictedAppViewModel by viewModels()
     private lateinit var manager: MediaProjectionManager
     private val MEDIA_PROJECTION_REQUEST_CODE = 1002
+
+    @Inject lateinit var userDao: UserDao
+
+    /** Persistent badge shown above the bottom nav. Reflects the current
+     * participant's role+code (e.g. `TCU-4821`, `TEST-0042`). Called on
+     * resume and after every TCU-code sync in the record flow. */
+    fun refreshParticipantBadge() {
+        lifecycleScope.launch {
+            val user = withContext(Dispatchers.IO) { runCatching { userDao.getUser() }.getOrNull() }
+            val code = user?.emailHash
+            val role = UserRolePrefs.getRole(applicationContext)
+            binding.participantBadge.text = UserRolePrefs.formatDisplayCode(code, role)
+        }
+    }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -52,6 +73,7 @@ class MainActivity : AppCompatActivity(), ScreenRecordFragment.MediaProjectionCa
     override fun onResume() {
         super.onResume()
         Timber.d("onResume")
+        refreshParticipantBadge()
     }
 
     private val requestPermissionLauncher = registerForActivityResult(
@@ -137,6 +159,7 @@ class MainActivity : AppCompatActivity(), ScreenRecordFragment.MediaProjectionCa
                 R.id.home -> binding.navHostFragment.findNavController().navigate(R.id.screenRecordFragment)
                 R.id.settings -> binding.navHostFragment.findNavController().navigate(R.id.settingsWrapper)
                 R.id.stats -> binding.navHostFragment.findNavController().navigate(R.id.screenshotStatsFragment)
+                R.id.profile -> binding.navHostFragment.findNavController().navigate(R.id.profileFragment)
             }
             true
         }

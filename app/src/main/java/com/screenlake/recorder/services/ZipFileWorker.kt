@@ -3,6 +3,8 @@ package com.screenlake.recorder.services
 import android.content.Context
 import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.screenlake.recorder.constants.ConstantSettings
 import com.screenlake.data.database.entity.ScreenshotEntity
@@ -78,6 +80,12 @@ class ZipFileWorker @AssistedInject constructor(
                 Timber.tag(TAG).d("Zip Worker has finished.")
                 generalOperationsRepository.saveLog("ZIP_WORKER_RUN_${System.currentTimeMillis()}", runId)
                 WorkerProgressManager.updateProgress("Finished zipping up screenshots.")
+
+                WorkManager.getInstance(applicationContext).enqueue(
+                    OneTimeWorkRequestBuilder<UploadWorker>().build()
+                )
+                Timber.tag(TAG).d("Chained UploadWorker enqueued.")
+
                 Result.success()
             }
         } catch (ex: Exception) {

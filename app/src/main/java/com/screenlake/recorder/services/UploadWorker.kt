@@ -5,6 +5,7 @@ import androidx.hilt.work.HiltWorker
 import androidx.lifecycle.MutableLiveData
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import com.screenlake.data.database.dao.UserDao
 import com.screenlake.data.database.entity.ScreenshotZipEntity
 import com.screenlake.data.database.entity.UserEntity
 import com.screenlake.data.repository.GeneralOperationsRepository
@@ -35,7 +36,8 @@ class UploadWorker @AssistedInject constructor(
     @Assisted context: Context,
     @Assisted workerParams: WorkerParameters,
     private val uploadHandler: UploadHandler,
-    private val generalOperationsRepository: GeneralOperationsRepository
+    private val generalOperationsRepository: GeneralOperationsRepository,
+    private val userDao: UserDao
 ) : CoroutineWorker(context, workerParams) {
 
     private var user: UserEntity? = null
@@ -76,6 +78,20 @@ class UploadWorker @AssistedInject constructor(
                     Timber.tag(TAG).d("No network connection. Upload Worker has finished.")
                     return Result.failure()
                 }
+
+                // Refresh AWS credentials by bridging the current Amplify session
+                // to AWSMobileClient. The Cognito User Pool idToken used by the
+                // Identity Pool expires after ~1 hour, so we re-federate on every
+                // worker run. Fire-and-forget: the subsequent S3 call will fail
+                // and get retried if bridging hasn't completed in time.
+                com.screenlake.recorder.authentication.CloudAuthentication
+                    .bridgeAwsMobileClient(applicationContext)
+
+                // Sync the TCU code from Cognito's `custom:tcu_code` attribute
+                // into the local user record. This is the only authoritative
+                // source of the participant's identifier; without it, uploads
+                // are refused by `RealUploadHandler.uploadFile`.
+                syncTcuCodeFromCognito()
 
                 generalOperationsRepository.saveLog("UPLOAD_SERVICE_RUN", "")
 
@@ -152,6 +168,40 @@ class UploadWorker @AssistedInject constructor(
         if (!file.exists()) {
             Timber.tag(TAG).w("Could not upload file ${file.name} because it does not exist on disk.")
             zip.id?.let { generalOperationsRepository.deleteScreenshotZip(zip) }
+        }
+    }
+
+    /**
+     * Reads the current Cognito user's `custom:tcu_code` attribute and writes
+     * it to the local user record's `emailHash` field. This is the only path
+     * by which the TCU code gets persisted locally — the typed signup code is
+     * never used. Safe to call on every worker run; no-op if the local value
+     * already matches.
+     */
+    private suspend fun syncTcuCodeFromCognito() {
+        try {
+            val attrs = com.amplifyframework.kotlin.core.Amplify.Auth.fetchUserAttributes()
+            val code = attrs.firstOrNull { it.key.keyString == "custom:tcu_code" }?.value
+            val role = attrs.firstOrNull { it.key.keyString == "custom:tcu_role" }?.value
+
+            if (code.isNullOrBlank() || !code.matches(Regex("\\d{4}"))) {
+                Timber.tag(TAG).w("No valid custom:tcu_code attribute on Cognito user; sync skipped.")
+                return
+            }
+
+            com.screenlake.data.UserRolePrefs.setRole(applicationContext, role)
+
+            val user = userDao.getUser() ?: run {
+                Timber.tag(TAG).w("No local user record; cannot persist TCU code.")
+                return
+            }
+            if (user.emailHash != code) {
+                Timber.tag(TAG).d("Syncing TCU code from Cognito: ${user.emailHash} -> $code")
+                user.emailHash = code
+                userDao.insertUserObj(user)
+            }
+        } catch (t: Throwable) {
+            Timber.tag(TAG).w(t, "syncTcuCodeFromCognito failed; proceeding with existing local value.")
         }
     }
 

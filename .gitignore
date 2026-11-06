@@ -9,3 +9,5 @@
 local.properties
 /app/google-services.json
 /.idea/
+/firebase-service-account.json
+/release-notes.txt

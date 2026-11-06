@@ -4,6 +4,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.devtools.ksp)
     alias(libs.plugins.firebase.crashlytics)
+    alias(libs.plugins.firebase.appdistribution)
     alias(libs.plugins.google.services)
     alias(libs.plugins.google.secrets)
     alias(libs.plugins.hilt.android)
@@ -68,6 +69,12 @@ android {
             buildConfigField("String", "COGNITO_IDENTITY_POOL_ID", "\"$cognitoIdentityPoolId\"")
             buildConfigField("String", "COGNITO_POOL_ID", "\"$cognitoUserPoolId\"")
             buildConfigField("String", "COGNITO_APP_CLIENT_ID", "\"$cognitoAppClientId\"")
+
+            firebaseAppDistribution {
+                serviceCredentialsFile = "${rootProject.projectDir}/firebase-service-account.json"
+                testers = "mythubanh@gmail.com"
+                releaseNotesFile = "${rootProject.projectDir}/release-notes.txt"
+            }
         }
 
         debug {
@@ -85,6 +92,12 @@ android {
             buildConfigField("String", "COGNITO_IDENTITY_POOL_ID", "\"$cognitoIdentityPoolId\"")
             buildConfigField("String", "COGNITO_POOL_ID", "\"$cognitoUserPoolId\"")
             buildConfigField("String", "COGNITO_APP_CLIENT_ID", "\"$cognitoAppClientId\"")
+
+            firebaseAppDistribution {
+                serviceCredentialsFile = "${rootProject.projectDir}/firebase-service-account.json"
+                testers = "mythubanh@gmail.com"
+                releaseNotesFile = "${rootProject.projectDir}/release-notes.txt"
+            }
         }
     }
 

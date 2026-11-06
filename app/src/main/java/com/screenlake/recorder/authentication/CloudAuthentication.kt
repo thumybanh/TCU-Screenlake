@@ -7,11 +7,17 @@ import androidx.lifecycle.MutableLiveData
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import com.amazonaws.mobile.auth.core.internal.util.ThreadUtils.runOnUiThread
+import com.amazonaws.mobile.client.AWSMobileClient
+import com.amazonaws.mobile.client.Callback
+import com.amazonaws.mobile.client.UserStateDetails
+import com.amazonaws.mobile.client.results.SignInResult
 import com.amplifyframework.auth.AuthException
 import com.amplifyframework.auth.AuthUserAttributeKey
 import com.amplifyframework.auth.cognito.AWSCognitoAuthSession
+import com.amplifyframework.auth.cognito.options.AWSCognitoAuthSignUpOptions
 import com.amplifyframework.auth.options.AuthSignUpOptions
 import com.amplifyframework.core.Amplify
+import com.screenlake.BuildConfig
 import com.screenlake.data.model.EmailPasswordData
 import com.screenlake.data.repository.AmplifyRepository
 import com.screenlake.recorder.services.util.CognitoErrorHelper
@@ -85,8 +91,12 @@ class CloudAuthentication @Inject constructor(
      * @param password The password.
      */
     fun signUp(password: String, context: Context) {
-        val options = AuthSignUpOptions.builder()
+        // Pass the participant's 4-digit code to the PreSignUp Lambda trigger via
+        // clientMetadata. The Lambda rejects the signup if the code does not match
+        // the researcher's pre-reservation for this email.
+        val options = AWSCognitoAuthSignUpOptions.builder()
             .userAttribute(AuthUserAttributeKey.email(), amplifyRepository.email)
+            .clientMetadata(mapOf("panel_code" to amplifyRepository.code))
             .build()
 
         Amplify.Auth.signUp(amplifyRepository.email, password, options,
@@ -96,10 +106,13 @@ class CloudAuthentication @Inject constructor(
              },
             { error ->
                 RegisterConfirmPassword.isRegisteredIn.postValue(false)
-                RegisterConfirmPassword.loginErrorMsg.postValue(error.message)
-                val errorMessage = CognitoErrorHelper.getReadableMessage(error)
+                // Surface the Lambda rejection message if present. Cognito wraps
+                // PreSignUp exceptions in the error cause; CognitoErrorHelper
+                // extracts the readable text.
+                val readable = CognitoErrorHelper.getReadableMessage(error)
+                RegisterConfirmPassword.loginErrorMsg.postValue(readable ?: error.message)
                 runOnUiThread {
-                    Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, readable, Toast.LENGTH_LONG).show()
                 }
                 Timber.e("Sign up error: $error")
             }
@@ -117,8 +130,14 @@ class CloudAuthentication @Inject constructor(
         val masterKeyAlias = MasterKeys.getOrCreate(keyGenParameterSpec)
 
         return context.get()?.let {
+            // Must match the filename used by RegisterLoadingFragment.createAndEncryptPassword.
+            // Previously this read from "encrypted_prefs" while signup wrote to
+            // "shared_preferences_filename", so autoSignIn always got empty creds
+            // and the Amplify session was never actually established —
+            // fetchUserAttributes then returned null, which the record screen
+            // surfaced as "could not fetch participant ID".
             EncryptedSharedPreferences.create(
-                "encrypted_prefs",
+                "shared_preferences_filename",
                 masterKeyAlias,
                 it,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
@@ -153,7 +172,10 @@ class CloudAuthentication @Inject constructor(
          */
         fun signIn(email: String, password: String) {
             Amplify.Auth.signIn(email, password,
-                { result -> Timber.d("Sign in result: $result") },
+                { result ->
+                    Timber.d("Sign in result: $result")
+                    bridgeAwsMobileClient()
+                },
                 { error -> Timber.e("Sign in error: $error") }
             )
         }
@@ -166,8 +188,86 @@ class CloudAuthentication @Inject constructor(
          */
         fun signInAsync(email: String, password: String) {
             Amplify.Auth.signIn(email, password,
-                { result -> Timber.d("Sign in result: $result") },
+                { result ->
+                    Timber.d("Sign in result: $result")
+                    bridgeAwsMobileClient()
+                },
                 { error -> Timber.e("Sign in error: $error") }
+            )
+        }
+
+        /**
+         * Tracks whether `Util.generates3ShareUrl` has already initialized the
+         * AWSMobileClient singleton. The upload code calls `initialize()` lazily
+         * the first time it needs an S3 client; `federatedSignIn()` requires
+         * that initialization to have run first, otherwise it throws. We cannot
+         * safely call `initialize()` from here because that path depends on
+         * `buildAWSConfiguration()` which lives in `Util.kt`, so instead we
+         * trigger the Util initialization explicitly before federating.
+         */
+        @Volatile private var mobileClientBridged = false
+
+        /**
+         * Bridges Amplify's Cognito User Pool session to AWSMobileClient so that
+         * the legacy S3 upload path (via `Util.generates3ShareUrl`) can obtain
+         * authenticated credentials from the Cognito Identity Pool.
+         *
+         * Without this bridge, AWSMobileClient initializes as anonymous and the
+         * Identity Pool (which has `AllowUnauthenticatedIdentities: false`)
+         * refuses to issue credentials, so `generatePresignedUrl` throws
+         * silently and no file ever reaches S3.
+         *
+         * This is a best-effort fire-and-forget call. If the Amplify session has
+         * no idToken yet, we skip — the next sign-in or app launch will retry.
+         */
+        fun bridgeAwsMobileClient(context: Context? = null) {
+            Amplify.Auth.fetchAuthSession(
+                { session ->
+                    try {
+                        val cognitoSession = session as? AWSCognitoAuthSession ?: return@fetchAuthSession
+                        val idToken = cognitoSession.userPoolTokens.value?.idToken
+                        if (idToken.isNullOrBlank()) {
+                            Timber.w("No idToken available yet; AWSMobileClient bridge skipped.")
+                            return@fetchAuthSession
+                        }
+
+                        // Ensure AWSMobileClient has been initialized at least
+                        // once. `Util().generates3ShareUrl` does this lazily; if
+                        // bridging runs first, the subsequent federatedSignIn
+                        // would fail with "AWSMobileClient not initialized".
+                        if (context != null) {
+                            try {
+                                com.screenlake.recorder.upload.Util().let { util ->
+                                    // Reflection-free way to trigger init without
+                                    // actually uploading anything: generate a URL
+                                    // for a dummy path. Failures are swallowed.
+                                    util.generates3ShareUrl(context, "/dev/null", "warmup/${System.currentTimeMillis()}")
+                                }
+                            } catch (ignored: Throwable) {
+                                // Swallow — we only cared about the init side-effect.
+                            }
+                        }
+
+                        val provider = "cognito-idp.${BuildConfig.AMAZON_REGION_NAME}.amazonaws.com/${BuildConfig.COGNITO_POOL_ID}"
+                        AWSMobileClient.getInstance().federatedSignIn(
+                            provider,
+                            idToken,
+                            object : Callback<UserStateDetails?> {
+                                override fun onResult(result: UserStateDetails?) {
+                                    mobileClientBridged = true
+                                    Timber.d("AWSMobileClient federated sign-in success: ${result?.userState}")
+                                }
+
+                                override fun onError(e: Exception?) {
+                                    Timber.e(e, "AWSMobileClient federated sign-in failed")
+                                }
+                            }
+                        )
+                    } catch (t: Throwable) {
+                        Timber.e(t, "bridgeAwsMobileClient failed")
+                    }
+                },
+                { error -> Timber.e("bridgeAwsMobileClient fetchAuthSession error: $error") }
             )
         }
     }

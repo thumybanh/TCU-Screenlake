@@ -18,6 +18,7 @@ easyPermissions = "3.0.0"
 espressoCore = "3.6.1"
 firebaseBom = "33.6.0"
 firebaseCrashlytics = "3.0.2"
+firebaseAppDistribution = "5.3.1"
 googlePlayServicesAuth = "21.2.0"
 googleServices = "4.4.2"
 gson = "2.11.0"
@@ -112,6 +113,7 @@ datastore-preferences = { group = "androidx.datastore", name = "datastore-prefer
 android-application = { id = "com.android.application", version.ref = "android" }
 devtools-ksp = { id = "com.google.devtools.ksp", version.ref = "devtoolsKsp" }
 firebase-crashlytics = { id = "com.google.firebase.crashlytics", version.ref = "firebaseCrashlytics" }
+firebase-appdistribution = { id = "com.google.firebase.appdistribution", version.ref = "firebaseAppDistribution" }
 google-secrets = { id = "com.google.android.libraries.mapsplatform.secrets-gradle-plugin", version.ref = "secrets" }
 google-services = { id = "com.google.gms.google-services", version.ref = "googleServices" }
 hilt-android = { id = "com.google.dagger.hilt.android", version.ref = "hilt" }

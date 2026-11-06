@@ -130,7 +130,95 @@ Sample 100–500 screenshots. Run Haiku vision with fixed prompt. Compare output
 
 ---
 
+## AWS migration + fixes (2026-10-05 to 2026-10-12)
+
+### Problems hit and fixes
+
+1. **Build failure "25"** — Gradle 8.9 incompatible with JDK 25. Fix: install JDK 21 via `brew install --cask temurin@21`, `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`.
+2. **`local.properties` ignored** — two files exist (`local.properties` + `app/local.properties`). Gradle reads root one only. Fix: edit root `local.properties`, not `app/`.
+3. **Spaces around `=` in `local.properties`** — Java Properties parser treats leading space as part of value. Fix: no spaces around `=`.
+4. **Lambda `assign_tcu_code` role propagation delay** — "role cannot be assumed by Lambda". Fix: `sleep 10` before `create-function`.
+5. **PostConfirmation Lambda event shape** — Lambda expected `{cognito_sub, cognito_username}` but Cognito sends `event.request.userAttributes.sub` and `event.userName`. Fix: added Cognito trigger shape detection in `handler.py`.
+6. **`admin-update-user-attributes` InvalidParameterException** — `custom:tcu_code` attribute missing from new user pool schema. Fix: `aws cognito-idp add-custom-attributes` to add it (one-way op, cannot delete).
+7. **ScreenshotService not running** — recording stopped after login. Fix: open app, tap big record button, grant MediaProjection permission.
+8. **UploadWorker dropped 4 orphan zips (18 MB each)** — zips survived on disk after uninstall but DB wiped. App cleaned them on restart since not in DB. Lost Oct 10 data (~603 shots).
+9. **Workers scheduled RUNNABLE but idle** — WorkManager periodic jobs #35, #37 waited for next hourly tick. Fix: hit Upload button in app Stats screen OR force-fire with `adb shell cmd jobscheduler run -f com.screenlake <id>`.
+10. **Phone-side pipeline fully alive after fresh login** — fresh Cognito tokens + manual Upload button triggered zip creation, upload, Lambda extraction, manifest writing. All verified.
+
+### Upload speed optimization (shipped)
+
+- `WorkerStarter.kt` — periodic 1h → 30 min, policy `KEEP` → `UPDATE`.
+- `ZipFileWorker.kt` — chains `OneTimeWorkRequest<UploadWorker>` on success.
+- Net effect: max end-to-end delay ~30 min (was ~2h). No manual button needed. 200-shot cap stays.
+
+---
+
+## OCR model research (2026-10-12)
+
+### Why considering a swap
+
+Current = Tesseract 4 (via `tesseract4android`), LSTM-only engine mode. Baseline accuracy on app screenshots ~70–85%. Status bar + UI chrome produces garbage text. Tiny fonts (captions, hashtags on images) often missed.
+
+For the tobacco study specifically: keyword matching on main content text works OK with Tesseract. Theme classification for FDA warning labels / small-print disclaimers would suffer.
+
+### Pilot methodology
+
+- 20 real screenshots from `s3://tcu-bucket/academia/tenant/.../1001/*.zip` (YouTube Shorts content)
+- Ran 4 engines on same JPGs, side-by-side comparison in `/tmp/ocr_pilot/comparison4.csv`
+- Measured: char count, speed, text quality (status bar handling, punctuation, main content accuracy)
+
+### Comparison table
+
+| OCR Engine | Monthly cost (60 users × 168K shots) | Accuracy | Avg chars extracted | Avg speed (ms/shot) | Status bar handling | Punctuation | On-device viable |
+|------------|------|----------|---------------------|---------------------|---------------------|-------------|------------------|
+| Tesseract 4 (current Android) | $0 | ~70–80% | ~334 | ~500–1000ms | Garbage ("n2eEBge-") | Weak | Yes (now) |
+| Tesseract 5 desktop | $0 | ~75–82% | 334 | 607ms | Garbage ("131 eege-") | Weak | Not applicable |
+| PaddleOCR PP-OCRv6 | $0 | ~90–93% | 346 | 7,894ms | Clean (filters UI) | Better | **No** (18× too slow) |
+| **RapidOCR (PP-OCR ONNX)** | **$0** | **~85–90%** | **356** | **435ms** | **Clean** ("11:31") | OK | **Yes** |
+| Google Cloud Vision | ~$10,500 | ~95%+ | n/a | ~200ms (API) | Clean | Excellent | Via API |
+| Bedrock Mistral OCR | ~$6,000 | ~90–93% | n/a | ~500ms (API) | Clean | Good | Via API |
+| AWS Textract | ~$15,000 | ~70–85% on UI | n/a | ~400ms (API) | Weak | OK | Via API |
+
+### Why choosing RapidOCR
+
+- **Free forever** (MIT license)
+- **Same accuracy as PaddleOCR, 18× faster** — uses PP-OCRv4 ONNX quantized models
+- **Clean status bar handling** — reads time correctly ("11:31" not "131 eege")
+- **Mobile-grade speed** — 435ms/shot on Mac, expected ~500ms–1s on Pixel 7a. Fits 5-second capture interval
+- **Has official Android port** — github.com/RapidAI/RapidOcrAndroidOnnx
+- **Keeps data on-device** — no network OCR, no API quotas, no PII leaving device
+- **No cloud dependency** — no Google billing, no AWS Bedrock, no API keys
+- Only Google Vision beats it on raw accuracy but costs $10K+/month
+
+### Rejected options
+
+- **Tesseract 5 upgrade**: Tesseract 5 LSTM ≈ Tesseract 4 LSTM. Marginal gain (~3–5 pp), not worth 1 week dev effort.
+- **PaddleOCR direct**: 7.9s/shot on Mac = unusable on-device. Would fall behind 60% per shot.
+- **Google Vision**: $10,500/mo at study scale. Need to pilot first before committing.
+- **AWS Textract**: trained on documents, poor on app UI. ~70–85% accuracy = no gain over Tesseract.
+- **Rekognition DetectText**: 50-word hard cap per image. Disqualified for dense screenshots.
+
+### Integration path (not yet started)
+
+- Add ONNX Runtime Android SDK (`onnxruntime-android` Gradle dep)
+- Download pretrained models (det + rec + cls, ~15 MB)
+- Replace `Recognize.kt processImage()` to call RapidOCR
+- Est effort: ~2–3 days
+
+### Pilot files (local, not in repo)
+
+- `/tmp/ocr_pilot/` — venv + comparison scripts (pilot2–4.py) + comparison CSVs
+- Dependencies: `python3.11`, `paddleocr`, `rapidocr-onnxruntime`, `pytesseract`, `tesseract` (brew)
+
+---
+
 ## Changelog (my edits)
 
 <!-- add entries as I ship changes -->
 - 2026-10-01: Created this notes file.
+- 2026-10-05: AWS migration to new TCU account (951662621099). New bucket `tcu-bucket`, new Cognito pool `us-east-2_5pvOLMS20`, new identity pool, redeployed both Lambdas, custom attribute `tcu_code` added to pool schema.
+- 2026-10-05: Rebranded SRK → TCU Screenlake. Primary color #4d1979. Logo replaced in all mipmap densities + drawables. `:ENTER YOUR UNIVERSITY HERE:` → Texas Christian University.
+- 2026-10-05: Added `TCU-` prefix to participant code input (`app:prefixText="TCU-"` in layout). Max 4 digits, numeric input only.
+- 2026-10-12: Lost Oct 10 data (~603 shots in 4 orphan zips). Zips survived uninstall on disk but DB wiped. App cleaned them on restart since not in DB.
+- 2026-10-12: Upload speed optimization — periodic 1h → 30 min, chained UploadWorker off ZipFileWorker. Max end-to-end delay ~30 min.
+- 2026-10-12: OCR pilot run. RapidOCR chosen as next OCR. Integration not yet started.

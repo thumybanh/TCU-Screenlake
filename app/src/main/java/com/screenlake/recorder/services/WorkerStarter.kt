@@ -55,8 +55,8 @@ class WorkerStarter @Inject constructor(
     private fun initUploadWorker() {
         workManager.enqueueUniquePeriodicWork(
             uniqueWorkName = WORK_MANAGER_UPLOAD_WORKER,
-            existingPeriodicWorkPolicy = ExistingPeriodicWorkPolicy.KEEP,
-            request = PeriodicWorkRequestBuilder<UploadWorker>(1, TimeUnit.HOURS)
+            existingPeriodicWorkPolicy = ExistingPeriodicWorkPolicy.UPDATE,
+            request = PeriodicWorkRequestBuilder<UploadWorker>(30, TimeUnit.MINUTES)
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -70,8 +70,8 @@ class WorkerStarter @Inject constructor(
     private fun initZipFileWorker() {
         workManager.enqueueUniquePeriodicWork(
             uniqueWorkName = WORK_MANAGER_ZIP_FILE_WORKER,
-            existingPeriodicWorkPolicy = ExistingPeriodicWorkPolicy.KEEP,
-            request = PeriodicWorkRequestBuilder<ZipFileWorker>(1, TimeUnit.HOURS)
+            existingPeriodicWorkPolicy = ExistingPeriodicWorkPolicy.UPDATE,
+            request = PeriodicWorkRequestBuilder<ZipFileWorker>(30, TimeUnit.MINUTES)
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiredNetworkType(NetworkType.NOT_REQUIRED)

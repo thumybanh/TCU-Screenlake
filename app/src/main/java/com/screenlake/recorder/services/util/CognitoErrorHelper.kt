@@ -45,9 +45,20 @@ object CognitoErrorHelper {
             exception.message?.contains("ResourceNotFoundException") == true ->
                 "We couldn't find your user account. Please check your username or email address."
             
-            // Lambda error
-            exception.message?.contains("UnexpectedLambdaException") == true ||
-            exception.message?.contains("UserLambdaValidationException") == true ->
+            // Lambda rejection — PreSignUp trigger rejected the signup. Cognito
+            // wraps the Lambda error as "PreSignUp failed with error <msg>".
+            // Surface the Lambda's own message so the participant sees the
+            // specific reason (bad code, email not registered, etc).
+            exception.message?.contains("UserLambdaValidationException") == true ||
+            exception.cause?.message?.contains("UserLambdaValidationException") == true -> {
+                val raw = exception.cause?.message ?: exception.message ?: ""
+                val extracted = Regex("PreSignUp failed with error (.+?)(?:\\.|$)")
+                    .find(raw)?.groupValues?.getOrNull(1)?.trim()
+                extracted ?: "Signup was rejected. Please check your email and participation code."
+            }
+
+            // Unexpected (non-validation) Lambda error
+            exception.message?.contains("UnexpectedLambdaException") == true ->
                 "There was an unexpected error with our authentication service. Please try again later."
             
             // Email/phone already in use

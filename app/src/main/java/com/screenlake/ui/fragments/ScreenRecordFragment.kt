@@ -655,32 +655,44 @@ class ScreenRecordFragment : Fragment(R.layout.fragment_screen_record), EasyPerm
 
         lifecycleScope.launch {
             val user = userDao.getUser()
-            if(user.emailHash.isNullOrEmpty()) {
-                // Try to auto-fetch the TCU code from Cognito before falling
-                // back to manual invite dialog. If the researcher already ran
-                // assign-code.sh for this participant, the Lambda wrote it to
-                // the custom:tcu_code attribute — we can pick it up silently.
-                val fetched = tryFetchTcuCodeFromCognito()
-                if (fetched != null) {
-                    user.emailHash = fetched
-                    userDao.insertUserObj(user)
-                    ScreenshotService.user = user
-                    Toast.makeText(
-                        this@ScreenRecordFragment.context,
-                        "Participant ID: TCU-$fetched",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    requestPermissions()
-                    requestPackageUsageStatsPermissions()
-                    startRecording()
-                } else {
-                    showMissingIdDialog()
-                }
-            }else{
-                requestPermissions()
-                requestPackageUsageStatsPermissions()
-                startRecording()
+
+            // The TCU code is the ONLY identifier that authorizes a participant
+            // to upload. It is set by the PostConfirmation Lambda as the Cognito
+            // `custom:tcu_code` attribute based on the researcher's pre-reservation
+            // for the participant's email. We never trust the typed signup code
+            // for upload paths, and we never fall back to a locally-cached
+            // "approved" state. If the Cognito attribute cannot be fetched here,
+            // the participant is not allowed to start recording.
+            val fetched = tryFetchTcuCodeFromCognito()
+
+            if (fetched.isNullOrBlank()) {
+                Timber.tag("ScreenRecordFragment")
+                    .w("No custom:tcu_code attribute on Cognito user. Blocking recording.")
+                user.emailHash = null
+                userDao.insertUserObj(user)
+                ScreenshotService.user = user
+                showMissingIdDialog()
+                return@launch
             }
+
+            if (user.emailHash != fetched) {
+                Timber.tag("ScreenRecordFragment")
+                    .d("Syncing TCU code from Cognito: ${user.emailHash} -> $fetched")
+                user.emailHash = fetched
+                userDao.insertUserObj(user)
+                ScreenshotService.user = user
+            }
+            refreshParticipantBadge()
+
+            // Bridge Amplify's Cognito session to AWSMobileClient so the S3
+            // upload path can obtain authenticated credentials. Fire-and-forget;
+            // the next upload cycle refreshes if needed.
+            com.screenlake.recorder.authentication.CloudAuthentication
+                .bridgeAwsMobileClient(this@ScreenRecordFragment.context?.applicationContext)
+
+            requestPermissions()
+            requestPackageUsageStatsPermissions()
+            startRecording()
         }
     }
 
@@ -688,11 +700,24 @@ class ScreenRecordFragment : Fragment(R.layout.fragment_screen_record), EasyPerm
      *  attributes. Returns null on any failure (offline, no such attribute,
      *  session expired) so the caller falls back to the manual invite dialog.
      */
+    private fun refreshParticipantBadge() {
+        // Badge now lives in MainActivity (persistent across screens).
+        (activity as? com.screenlake.MainActivity)?.refreshParticipantBadge()
+    }
+
     private suspend fun tryFetchTcuCodeFromCognito(): String? {
         return try {
             val attrs = com.amplifyframework.kotlin.core.Amplify.Auth.fetchUserAttributes()
             val value = attrs.firstOrNull { it.key.keyString == "custom:tcu_code" }?.value
-            if (!value.isNullOrBlank() && validateCode(value)) value else null
+            val role = attrs.firstOrNull { it.key.keyString == "custom:tcu_role" }?.value
+            if (!value.isNullOrBlank() && validateCode(value)) {
+                // Cache the role alongside the code so RealUploadHandler can
+                // decide the S3 prefix without an extra Cognito call per upload.
+                context?.applicationContext?.let { ctx ->
+                    com.screenlake.data.UserRolePrefs.setRole(ctx, role)
+                }
+                value
+            } else null
         } catch (t: Throwable) {
             Timber.tag("ScreenRecordFragment").w(t, "fetchUserAttributes failed; falling back to invite dialog")
             null
@@ -839,28 +864,30 @@ class ScreenRecordFragment : Fragment(R.layout.fragment_screen_record), EasyPerm
         val builder = AlertDialog.Builder(context)
             .setTitle("Participant ID")
             .setMessage("Enter the 4-digit code your researcher assigned. Your ID will look like TCU-XXXX.")
-            .setPositiveButton("Continue") { dialog, _ ->
-                val inviteCode = codeEditText.text.toString().trim().removePrefix("TCU-").removePrefix("tcu-")
-                if (inviteCode.isNotEmpty()) {
-
-                    if (!validateCode(inviteCode)) {
-                        Toast.makeText(context, "Error -> Please enter a valid 4 digit invite code", Toast.LENGTH_SHORT).show()
+            .setPositiveButton("Retry") { dialog, _ ->
+                // The TCU code can ONLY be sourced from the Cognito
+                // `custom:tcu_code` attribute set by the researcher's
+                // pre-reservation flow. We never accept a locally-typed code
+                // as a substitute: that would let a participant upload under
+                // an arbitrary panelist path they chose themselves, which
+                // breaks researcher attribution. Instead, re-attempt the sync
+                // via the standard start-recording flow.
+                lifecycleScope.launch {
+                    val fetched = tryFetchTcuCodeFromCognito()
+                    if (fetched.isNullOrBlank()) {
+                        Toast.makeText(
+                            context,
+                            "Could not fetch your Participant ID. Make sure you are online and signed in, then contact your researcher if the problem persists.",
+                            Toast.LENGTH_LONG
+                        ).show()
                     } else {
-                        // Process the invite code
-                        lifecycleScope.launch {
-                            val user = userDao.getUser()
-                            user.emailHash = inviteCode
-
-                            userDao.insertUserObj(user)
-                            ScreenshotService.user = user
-                        }
-
-                        Toast.makeText(context, "Participant ID: TCU-$inviteCode", Toast.LENGTH_SHORT).show()
+                        val user = userDao.getUser()
+                        user.emailHash = fetched
+                        userDao.insertUserObj(user)
+                        ScreenshotService.user = user
+                        Toast.makeText(context, "Participant ID: TCU-$fetched", Toast.LENGTH_SHORT).show()
                         dialog.dismiss()
                     }
-                } else {
-                    Toast.makeText(context, "Please enter a valid invite code", Toast.LENGTH_SHORT).show()
-                    // Keep the dialog open
                 }
             }
             .setNegativeButton("Cancel") { dialog, _ ->

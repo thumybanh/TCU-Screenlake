@@ -39,6 +39,7 @@ import com.screenlake.data.model.AppInfo
 import com.screenlake.data.repository.GeneralOperationsRepository
 import com.screenlake.recorder.constants.ConstantSettings.ACTION_PAUSE_SERVICE
 import com.screenlake.recorder.constants.ConstantSettings.ACTION_STOP_SERVICE
+import com.screenlake.recorder.constants.ConstantSettings
 import com.screenlake.recorder.constants.ConstantSettings.RESTRICTED_APPS
 import com.screenlake.recorder.constants.ConstantSettings.SCREENSHOT_MAPPING
 import com.screenlake.recorder.ocr.Assets
@@ -782,7 +783,7 @@ class ScreenshotService : Service(), ScreenStateReceiver.ScreenStateCallback {
 
                 // Save the bitmap to a file
                 fileOutputStream = FileOutputStream(screenshotsDir)
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 50, fileOutputStream)
+                bitmap.compress(Bitmap.CompressFormat.JPEG, ConstantSettings.SCREENSHOT_IMAGE_QUALITY, fileOutputStream)
                 Timber.d("Screenshot saved: ${screenshotsDir.absolutePath}")
             } catch (e: IOException) {
                 e.record()
@@ -946,12 +947,18 @@ class ScreenshotService : Service(), ScreenStateReceiver.ScreenStateCallback {
     }
 
     private fun beginOcr() = CoroutineScope(Dispatchers.IO).launch {
-        val screenshots = generalOperationsRepository.getScreenshotsToOcr(1000)
-        Timber.tag(TAG).d("Starting OCR: Processing ${screenshots.size} images.")
+        // Smaller OCR window when triggered manually: processing 1000 images at
+        // once can take 20+ minutes on slow phones, which is long enough that
+        // Android often kills the service for using too much memory or CPU and
+        // the user is bounced back to the launcher. Cap manual runs at 200.
+        val isManual = manualOcr.value == true
+        val fetchCap = if (isManual) 200 else 1000
+        val screenshots = generalOperationsRepository.getScreenshotsToOcr(fetchCap)
+        Timber.tag(TAG).d("Starting OCR: Processing ${screenshots.size} images (manual=$isManual).")
         processedCount = 0
 
         // Only proceed if there are enough images to process
-        if ((screenshots.size >= OCR_IMAGE_THRESHOLD && isOlderThanTwoHours(lastOcrTime)) || manualOcr.value == true) {
+        if ((screenshots.size >= OCR_IMAGE_THRESHOLD && isOlderThanTwoHours(lastOcrTime)) || isManual) {
             lastOcrTime = System.currentTimeMillis()
 
             WorkerProgressManager.clear()
@@ -960,7 +967,7 @@ class ScreenshotService : Service(), ScreenStateReceiver.ScreenStateCallback {
                 delay(3000)
 
                 screenshots.chunked(50).forEachIndexed { batchIndex, imagesToOcr ->
-                    WorkerProgressManager.updateProgress("Starting OCR batch ${batchIndex + 1}")
+                    WorkerProgressManager.updateProgress("OCR batch ${batchIndex + 1}")
 
                     withContext(Dispatchers.IO) {
                         recognizeImages(imagesToOcr, screenshots.size)  // Process the images in batches
@@ -982,29 +989,41 @@ class ScreenshotService : Service(), ScreenStateReceiver.ScreenStateCallback {
                             .enqueue()
 
                         try {
-                            // Wait for the operation to complete
-                            workContinuation.result.await()
-                            // Operation completed successfully
+                            // Cap each per-batch wait at 5 minutes. Without this,
+                            // if the OS defers either worker (battery, Doze, memory
+                            // pressure) the await() suspension never resumes and
+                            // the manualOcr flag stays `true` forever — the UI
+                            // button is stuck on "Uploading…" and the user has
+                            // no way to recover without force-stopping the app.
+                            withTimeout(5 * 60 * 1000L) {
+                                workContinuation.result.await()
+                            }
                             Timber.d("ScreenshotService: Work operation completed successfully")
+                        } catch (e: TimeoutCancellationException) {
+                            Timber.w(e, "ScreenshotService: zip/upload chain exceeded 5 min; abandoning wait so UI unblocks.")
+                            generalOperationsRepository.saveLog(
+                                "UPLOAD_CHAIN_TIMEOUT",
+                                "Zip+upload chain did not complete within 5 min; workers continue in background."
+                            )
+                            // Break out of the batch loop; the enqueued workers
+                            // keep running in the background and will succeed or
+                            // retry on the next tick.
+                            return@forEachIndexed
                         } catch (e: Exception) {
-                            // Operation failed
                             Timber.e(e, "ScreenshotService: Work operation failed")
                         }
-                    }else{
+                    } else {
                         return@launch
                     }
                 }
 
-                manualOcr.postValue(false)
-                ocrSubmitted = false
                 Timber.tag(TAG).d("Ending OCR.")
             } catch (ex: Exception) {
-                // handleOcrException(ex)
                 generalOperationsRepository.saveLog("OCR_ERROR", "OCR failed: ${ex.stackTraceToString()}")
                 ex.record()
-                ocrSubmitted = false
-                manualOcr.postValue(false)
             } finally {
+                // Always reset manualOcr so the "Uploading…" button becomes
+                // tappable again, even if OCR crashed or a timeout fired.
                 System.gc()  // Trigger garbage collection to free memory
                 ocrSubmitted = false
                 manualOcr.postValue(false)

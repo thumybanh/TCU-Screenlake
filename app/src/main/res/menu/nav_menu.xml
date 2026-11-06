@@ -12,6 +12,11 @@
         android:title="Stats" />
 
     <item
+        android:id="@+id/profile"
+        android:icon="@android:drawable/ic_menu_myplaces"
+        android:title="Profile" />
+
+    <item
         android:id="@+id/settings"
         android:icon="@drawable/ic_baseline_settings_24"
         android:title="Settings" />
