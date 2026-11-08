@@ -27,10 +27,13 @@ to any field — not just the fields the migration itself modifies.
 
 Safety guarantees
 -----------------
-- Backup is written to disk BEFORE any DynamoDB writes (atomic temp-rename).
-- Existing backup is never overwritten: if backup file already exists the script
-  verifies the live DDB state still matches that backup before proceeding.
-  If live state diverged, the script refuses and asks you to investigate.
+- Backup is written to disk BEFORE any DynamoDB writes (atomic temp+link).
+- Existing backup is never overwritten: os.link() fails atomically if another
+  process creates the backup file between our existence check and the write.
+  os.rename() can silently replace an existing file; os.link() cannot.
+- If backup already exists (previous run, concurrent write), the script verifies
+  the live DDB state still matches that backup before proceeding. If diverged,
+  the script refuses and asks you to investigate.
 - Rollback verifies that EVERY field in the UUID item still matches what the
   migration wrote. If the account was subsequently updated (e.g. assigned an RS
   code via migrate_researcher), rollback refuses rather than overwriting.
@@ -67,6 +70,7 @@ Do not run this script without prior approval.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sys
@@ -319,23 +323,44 @@ def detect_state(
 # ---------------------------------------------------------------------------
 
 def _write_backup_atomic(backup: dict, path: str) -> None:
-    """Write backup JSON atomically via a temp file and os.rename.
+    """Write backup JSON atomically, refusing to overwrite an existing file.
 
-    os.rename is atomic on POSIX when src and dst are on the same filesystem.
-    The temp file is created in the same directory to ensure this.
+    Uses a temp file + os.link (not os.rename) for two reasons:
+    - os.link() fails atomically with EEXIST if path already exists; os.rename()
+      would silently replace it, defeating the no-overwrite guarantee.
+    - os.link() on POSIX with src and dst on the same filesystem is atomic; since
+      the temp file is created in the same directory as path, this is guaranteed.
+
+    Calls f.flush() + os.fsync() before os.link() so data is fully on disk
+    before the file becomes visible at the final path.
+
+    Raises FileExistsError if path already exists (including a race where another
+    process creates it between the caller's existence check and this write).
     """
     directory = os.path.dirname(os.path.abspath(path))
     fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(backup, f, indent=2, default=str)
-        os.rename(tmp_path, path)
-    except Exception:
+            f.flush()
+            os.fsync(f.fileno())
+        # os.link is atomic and fails with EEXIST if path exists.
+        os.link(tmp_path, path)
+    except OSError as e:
+        if e.errno == errno.EEXIST:
+            raise FileExistsError(
+                f"Backup file already exists: {path}\n"
+                "Another process may have created it concurrently, or a previous "
+                "run wrote it. Load and verify the existing backup before proceeding."
+            ) from e
+        raise
+    finally:
+        # Remove the temp file. After a successful os.link the inode has two
+        # hard links; unlinking the temp path leaves path intact.
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
-        raise
 
 
 def _verify_backup_matches_live(
@@ -458,13 +483,34 @@ def run_migration(
 
     # --- Build merged item and transaction conditions ---
     epoch = int(time.time())
-    merged_py  = build_merged_item(legacy_py, uuid_py, epoch)
-    merged_raw = _item_to_ddb(merged_py)
+    merged_py = build_merged_item(legacy_py, uuid_py, epoch)
 
-    # Condition for UUID stub Put: ALL backup fields must still match +
+    # Condition for UUID stub Update: ALL backup fields must still match +
     # guarded-absent fields must still be absent.
-    uuid_cond, uuid_names, uuid_vals = build_snapshot_condition(
+    uuid_cond, uuid_cond_names, uuid_cond_vals = build_snapshot_condition(
         uuid_py, UUID_STUB_GUARDED_ABSENT
+    )
+
+    # Fields to SET on the UUID stub: all merged fields that are NOT already
+    # present in the stub.  Using Update (not Put) means any field present on
+    # the item that is not in this SET expression is left untouched — including
+    # fields added by a concurrent write not covered by guarded-absent list.
+    # Limitation: the guarded-absent list cannot enumerate every field a future
+    # or ad-hoc tool might write.  For the KNOWN handler write paths (assignment,
+    # claim, pre-reservation) the guards are exhaustive.  An unknown concurrent
+    # field that slips through the guards is preserved by the Update rather than
+    # silently overwritten.  The rollback Put cannot offer the same guarantee
+    # (documented at the rollback transaction below).
+    stub_field_set = set(uuid_py)       # {id, role} — fields already on stub
+    fields_to_set = {
+        f: merged_py[f]
+        for f in merged_py
+        if f not in stub_field_set      # excludes id and role (already there)
+    }
+    uuid_upd_names = {f"#u_{f}": f for f in fields_to_set}
+    uuid_upd_vals  = {f":u_{f}": _py_to_ddb(v) for f, v in fields_to_set.items()}
+    uuid_upd_expr  = "SET " + ", ".join(
+        f"#u_{f} = :u_{f}" for f in sorted(fields_to_set)
     )
 
     # Condition for legacy key Delete: ALL backup fields match + guarded-absent.
@@ -476,12 +522,12 @@ def run_migration(
     code_cond, code_names, code_vals = build_snapshot_condition(
         code_py, CODE1001_GUARDED_ABSENT
     )
-    # Update expression needs its own alias for the field being changed.
     code_upd_names = {"#u_cognito_sub": "cognito_sub"}
     code_upd_vals  = {":u_cognito_sub": {"S": UUID_SUB}}
 
     print(f"\n--- Migration plan ---")
-    print(f"  PUT    {UUID_KEY}  ({len(merged_py)} fields)")
+    print(f"  UPDATE {UUID_KEY}  SET {len(fields_to_set)} field(s)")
+    print(f"         (Update not Put — existing fields not in SET are preserved)")
     print(f"         Snapshot condition pins {len(uuid_py) - 1} field(s) + "
           f"{len(UUID_STUB_GUARDED_ABSENT)} absent-field guard(s)")
     print(f"  DELETE {LEGACY_KEY}")
@@ -505,7 +551,11 @@ def run_migration(
         },
     }
 
-    if os.path.exists(backup_path):
+    try:
+        print(f"\nWriting backup to {backup_path} ...")
+        _write_backup_atomic(backup, backup_path)
+        print("Backup written.")
+    except FileExistsError:
         print(f"\nBackup file already exists at {backup_path}.")
         print("Verifying live state matches that backup before reusing it...")
         with open(backup_path) as f:
@@ -522,22 +572,19 @@ def run_migration(
             )
             return {"status": "error", "reason": msg}
         print("  Live state matches backup. Reusing existing backup.")
-    else:
-        print(f"\nWriting backup to {backup_path} ...")
-        _write_backup_atomic(backup, backup_path)
-        print("Backup written.")
 
     # --- Execute transaction ---
     print(f"\nExecuting DynamoDB transaction...")
     try:
         ddb.transact_write_items(TransactItems=[
             {
-                "Put": {
+                "Update": {
                     "TableName": table_name,
-                    "Item": merged_raw,
+                    "Key": {"id": {"S": UUID_KEY}},
+                    "UpdateExpression": uuid_upd_expr,
                     "ConditionExpression": uuid_cond,
-                    "ExpressionAttributeNames":  uuid_names,
-                    "ExpressionAttributeValues": uuid_vals,
+                    "ExpressionAttributeNames":  {**uuid_cond_names, **uuid_upd_names},
+                    "ExpressionAttributeValues": {**uuid_cond_vals, **uuid_upd_vals},
                 }
             },
             {

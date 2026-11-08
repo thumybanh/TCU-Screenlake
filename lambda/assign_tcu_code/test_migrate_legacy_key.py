@@ -534,16 +534,50 @@ class TestBackupHelpers(unittest.TestCase):
             self.assertEqual(data["key"], "value")
 
     def test_atomic_write_no_partial_file_on_error(self):
-        """If os.rename fails, neither the target path nor a tmp file should remain."""
+        """If os.link fails (non-EEXIST), neither the target path nor a tmp file should remain."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test_backup.json")
-            with patch("migrate_legacy_key.os.rename", side_effect=OSError("simulated disk full")):
+            import errno as _errno
+            with patch("migrate_legacy_key.os.link", side_effect=OSError(_errno.ENOSPC, "no space left")):
                 with self.assertRaises(OSError):
                     _write_backup_atomic({"key": "value"}, path)
             # Target must not exist
             self.assertFalse(os.path.exists(path))
             # No leftover tmp files either
             self.assertEqual(os.listdir(tmpdir), [])
+
+    def test_atomic_write_raises_file_exists_error_when_target_exists(self):
+        """os.link raises FileExistsError when backup file already exists on disk."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test_backup.json")
+            with open(path, "w") as f:
+                f.write("{}")
+            with self.assertRaises(FileExistsError):
+                _write_backup_atomic({"key": "value"}, path)
+
+    def test_atomic_write_raises_file_exists_error_on_concurrent_creation(self):
+        """os.link raising EEXIST mid-flight (concurrent process) becomes FileExistsError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test_backup.json")
+            import errno as _errno
+            with patch("migrate_legacy_key.os.link", side_effect=OSError(_errno.EEXIST, "file exists")):
+                with self.assertRaises(FileExistsError):
+                    _write_backup_atomic({"key": "value"}, path)
+
+    def test_atomic_write_calls_fsync(self):
+        """fsync must be called before os.link so data is durable before DDB writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test_backup.json")
+            fsync_calls = []
+            original_fsync = os.fsync
+
+            def recording_fsync(fd):
+                fsync_calls.append(fd)
+                return original_fsync(fd)
+
+            with patch("migrate_legacy_key.os.fsync", side_effect=recording_fsync):
+                _write_backup_atomic({"key": "value"}, path)
+            self.assertTrue(len(fsync_calls) >= 1, "os.fsync was not called")
 
     def test_backup_not_overwritten_when_already_exists(self):
         """Re-running migration with existing backup file must not overwrite it."""
@@ -718,6 +752,82 @@ class TestMigrationSuccess(unittest.TestCase):
         self.assertIn(LEGACY_KEY, backup["items"])
         self.assertIn(UUID_KEY,   backup["items"])
         self.assertIn(CODE_KEY,   backup["items"])
+
+
+# ---------------------------------------------------------------------------
+# Migration: Update preserves unlisted fields / backup-exists flow
+# ---------------------------------------------------------------------------
+
+class TestMigrationUpdateBehavior(unittest.TestCase):
+
+    def _make_backup_path(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        return path
+
+    def test_migration_update_preserves_unlisted_field_on_uuid_stub(self):
+        """Update (not Put) leaves an unlisted concurrent field intact after migration."""
+        fake = _pre_migration_ddb()
+        # Inject an extra field on the UUID stub that isn't in UUID_STUB_GUARDED_ABSENT
+        fake._items[UUID_KEY]["extra_future_field"] = {"S": "concurrent_value"}
+        backup_path = self._make_backup_path()
+        try:
+            result = run_migration(fake, "screenlake-tcu-codes", backup_path, dry_run=False)
+            self.assertEqual(result["status"], "complete")
+            uuid_py = _py(fake._items[UUID_KEY])
+            self.assertEqual(
+                uuid_py.get("extra_future_field"), "concurrent_value",
+                "Update must preserve fields not listed in SET expression",
+            )
+        finally:
+            if os.path.exists(backup_path):
+                os.unlink(backup_path)
+
+    def test_migration_proceeds_when_backup_exists_and_matches(self):
+        """Re-run with existing matching backup succeeds (idempotent second run)."""
+        fake = _pre_migration_ddb()
+        backup_path = self._make_backup_path()
+        try:
+            # First run creates backup and migrates
+            r1 = run_migration(fake, "screenlake-tcu-codes", backup_path, dry_run=False)
+            self.assertEqual(r1["status"], "complete")
+            self.assertTrue(os.path.exists(backup_path))
+            with open(backup_path) as f:
+                backup_before = f.read()
+            # Second run on already-migrated state must not overwrite backup
+            r2 = run_migration(fake, "screenlake-tcu-codes", backup_path, dry_run=False)
+            self.assertIn(r2["status"], ("complete", "already_complete"))
+            with open(backup_path) as f:
+                backup_after = f.read()
+            self.assertEqual(backup_before, backup_after)
+        finally:
+            if os.path.exists(backup_path):
+                os.unlink(backup_path)
+
+    def test_rollback_limitation_unlisted_post_migration_field_lost(self):
+        """Documents known limitation: rollback Put cannot preserve a field added
+        after migration that wasn't in the rollback condition guards."""
+        fake = _pre_migration_ddb()
+        backup_path = self._make_backup_path()
+        try:
+            run_migration(fake, "screenlake-tcu-codes", backup_path, dry_run=False)
+            # Simulate a post-migration write adding a field not in rollback guards
+            fake._items[UUID_KEY]["post_migration_field"] = {"S": "added_after"}
+            # Rollback Put restores the exact pre-migration snapshot — post-migration
+            # field is not in the snapshot, so it will be absent after rollback.
+            result = run_rollback(fake, "screenlake-tcu-codes", backup_path)
+            # Rollback may succeed or be blocked by condition, but if it succeeds
+            # the post_migration_field is gone — this is the documented limitation.
+            if result["status"] == "complete":
+                uuid_py = _py(fake._items.get(UUID_KEY, {}))
+                self.assertNotIn(
+                    "post_migration_field", uuid_py,
+                    "Known limitation: rollback Put loses post-migration fields not in guards",
+                )
+        finally:
+            if os.path.exists(backup_path):
+                os.unlink(backup_path)
 
 
 # ---------------------------------------------------------------------------
