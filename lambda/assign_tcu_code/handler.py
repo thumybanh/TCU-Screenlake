@@ -1254,14 +1254,20 @@ def _migrate_researcher_account(
                     "Key": {"id": {"S": f"pre#{email}"}},
                     "UpdateExpression": "SET claimed = :t, claimed_by_sub = :s, claimed_at_epoch = :e",
                     "ExpressionAttributeValues": {
-                        ":t":    {"BOOL": True},
-                        ":s":    {"S": sub},
-                        ":e":    {"N": str(epoch)},
-                        ":false": {"BOOL": False},
+                        ":t":         {"BOOL": True},
+                        ":s":         {"S": sub},
+                        ":e":         {"N": str(epoch)},
+                        ":false":     {"BOOL": False},
+                        ":rs_code":   {"S": formatted},
                     },
-                    # Reservation must still exist and must not have been claimed
+                    # Reservation must still exist, refer to this exact RS code,
+                    # and must not have been claimed by a concurrent call.
+                    # tcu_code = :rs_code guards against the reservation being
+                    # deleted and recreated for a different RS code between our
+                    # ownership read and this transaction write.
                     "ConditionExpression": (
                         "attribute_exists(id) AND "
+                        "tcu_code = :rs_code AND "
                         "(attribute_not_exists(claimed) OR claimed = :false)"
                     ),
                 }
@@ -1295,7 +1301,7 @@ def _migrate_researcher_account(
             reasons = e.response.get("CancellationReasons", [])
             item_labels = [
                 f"user#{sub} (tcu_code changed or record deleted)",
-                f"pre#{email} (reservation missing or already claimed)",
+                f"pre#{email} (reservation missing, RS code changed, or already claimed)",
                 f"code#RS{n} (slot ownership changed or concurrently claimed)",
             ]
             failed = [

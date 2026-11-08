@@ -1535,6 +1535,21 @@ def test_migrate_transaction_aborts_when_pre_reservation_missing():
         _migrate("sub-M", "mythubanh@gmail.com", "RS0006", prefills=prefills)
 
 
+def test_migrate_transaction_aborts_when_pre_reservation_rs_code_changed():
+    """pre#email tcu_code changed to a different RS code between read and transaction.
+
+    Scenario: researcher deletes reservation RS0006 for this email and creates a
+    new one (RS0007) while the migration is in flight. The transaction must reject
+    claiming the RS0006 slot against a reservation that now points to RS0007.
+    """
+    prefills = _migration_prefills()
+    # Reservation now points to a different RS code
+    prefills["pre#mythubanh@gmail.com"]["tcu_code"] = "RS0007"
+
+    with pytest.raises(H.HandlerError, match="concurrent modification"):
+        _migrate("sub-M", "mythubanh@gmail.com", "RS0006", prefills=prefills)
+
+
 def test_migrate_transaction_aborts_when_code_lock_claimed_concurrently():
     """code#RS0006 claimed by a different sub between ownership read and transaction.
     The ownership read (before the transaction) catches this case and raises.
