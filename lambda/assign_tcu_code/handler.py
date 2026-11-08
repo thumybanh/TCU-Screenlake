@@ -1206,6 +1206,24 @@ def _migrate_researcher_account(
     old_code = existing_user.get("tcu_code", "")
 
     # --- Atomic migration transaction ---
+    # Every item carries a ConditionExpression that re-checks the state we
+    # verified in the ownership reads above. This closes the TOCTOU window
+    # between the reads and the writes: if any record changed concurrently
+    # (e.g. another caller claims the RS slot, or the user record is deleted),
+    # the entire transaction cancels atomically before any item is written.
+    #
+    # Item 0 — user#<sub>:
+    #   attribute_exists(id)        — record must still exist (not deleted)
+    #   tcu_code = :old_code        — must not have been migrated concurrently
+    #
+    # Item 1 — pre#<email>:
+    #   attribute_exists(id)        — reservation must still exist
+    #   (claimed = false or absent) — must not have been claimed by another call
+    #
+    # Item 2 — code#RS<n>:
+    #   pre_reserved = true         — slot must still be a pre-reservation
+    #   email = :expected_email     — must still belong to this exact email
+    #   (claimed = false or absent) — must not have been concurrently claimed
     try:
         ddb_client.transact_write_items(TransactItems=[
             {
@@ -1219,14 +1237,15 @@ def _migrate_researcher_account(
                     ),
                     "ExpressionAttributeNames": {"#rl": "role"},
                     "ExpressionAttributeValues": {
-                        ":code": {"S": formatted},
-                        ":role": {"S": ROLE_RS},
-                        ":old":  {"S": old_code},
-                        ":e":    {"N": str(epoch)},
-                        ":by":   {"S": caller_identity},
+                        ":code":     {"S": formatted},
+                        ":role":     {"S": ROLE_RS},
+                        ":old":      {"S": old_code},
+                        ":e":        {"N": str(epoch)},
+                        ":by":       {"S": caller_identity},
+                        ":old_code": {"S": old_code},
                     },
-                    # Guard: record must already exist — never create on migrate
-                    "ConditionExpression": "attribute_exists(id)",
+                    # Record must exist and tcu_code must be unchanged since our read
+                    "ConditionExpression": "attribute_exists(id) AND tcu_code = :old_code",
                 }
             },
             {
@@ -1235,10 +1254,16 @@ def _migrate_researcher_account(
                     "Key": {"id": {"S": f"pre#{email}"}},
                     "UpdateExpression": "SET claimed = :t, claimed_by_sub = :s, claimed_at_epoch = :e",
                     "ExpressionAttributeValues": {
-                        ":t": {"BOOL": True},
-                        ":s": {"S": sub},
-                        ":e": {"N": str(epoch)},
+                        ":t":    {"BOOL": True},
+                        ":s":    {"S": sub},
+                        ":e":    {"N": str(epoch)},
+                        ":false": {"BOOL": False},
                     },
+                    # Reservation must still exist and must not have been claimed
+                    "ConditionExpression": (
+                        "attribute_exists(id) AND "
+                        "(attribute_not_exists(claimed) OR claimed = :false)"
+                    ),
                 }
             },
             {
@@ -1247,10 +1272,20 @@ def _migrate_researcher_account(
                     "Key": {"id": {"S": f"code#RS{n}"}},
                     "UpdateExpression": "SET claimed = :t, claimed_by_sub = :s, claimed_at_epoch = :e",
                     "ExpressionAttributeValues": {
-                        ":t": {"BOOL": True},
-                        ":s": {"S": sub},
-                        ":e": {"N": str(epoch)},
+                        ":t":              {"BOOL": True},
+                        ":s":              {"S": sub},
+                        ":e":              {"N": str(epoch)},
+                        ":true":           {"BOOL": True},
+                        ":expected_email": {"S": email},
+                        ":false":          {"BOOL": False},
                     },
+                    # Slot must still be a pre-reservation for this exact email,
+                    # and must not have been claimed by any concurrent call
+                    "ConditionExpression": (
+                        "pre_reserved = :true AND "
+                        "email = :expected_email AND "
+                        "(attribute_not_exists(claimed) OR claimed = :false)"
+                    ),
                 }
             },
         ])
@@ -1258,11 +1293,20 @@ def _migrate_researcher_account(
         code = e.response.get("Error", {}).get("Code", "")
         if code == "TransactionCanceledException":
             reasons = e.response.get("CancellationReasons", [])
-            # First item (user# Update) failed → record no longer exists or
-            # was deleted concurrently. Refuse to proceed.
-            if reasons and reasons[0].get("Code") == "ConditionalCheckFailed":
+            item_labels = [
+                f"user#{sub} (tcu_code changed or record deleted)",
+                f"pre#{email} (reservation missing or already claimed)",
+                f"code#RS{n} (slot ownership changed or concurrently claimed)",
+            ]
+            failed = [
+                item_labels[i]
+                for i, r in enumerate(reasons)
+                if r.get("Code") == "ConditionalCheckFailed"
+            ]
+            if failed:
                 raise HandlerError(
-                    f"user#{sub} disappeared during transaction. Migration aborted."
+                    "Migration aborted — concurrent modification detected: "
+                    + "; ".join(failed)
                 )
         raise HandlerError(f"Migration transaction failed: {e}")
 

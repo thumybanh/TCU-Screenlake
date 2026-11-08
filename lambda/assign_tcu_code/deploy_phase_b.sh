@@ -340,30 +340,35 @@ echo "Next: Phase C (researcher migration) requires separate approval."
 # ==============================================================================
 # ROLLBACK (run manually only if needed):
 #
-#   ROLLBACK_CHECK=$(aws lambda get-function-configuration \
+#   Requires DEPLOYED_SHA to be set (recorded automatically in B4).
+#   If DEPLOYED_SHA is missing or empty, the rollback refuses to proceed —
+#   deploying over an unknown state risks overwriting an unrelated deployment.
+#
+#   ROLLBACK_CHECK_JSON=$(aws lambda get-function-configuration \
 #     --function-name screenlake-assign-tcu \
 #     --region us-east-2 \
 #     --query '{CodeSha256:CodeSha256,RevisionId:RevisionId}' \
 #     --output json)
 #
-#   python3 - <<'PYEOF'
-#   import json, os, sys
-#   d = json.loads(os.popen("echo '$ROLLBACK_CHECK'").read())
-#   # Verify live SHA matches what was deployed in B4 before we overwrite it
-#   deployed_sha = os.environ.get("DEPLOYED_SHA", "")
-#   live_sha     = d["CodeSha256"]
-#   live_rev     = d["RevisionId"]
-#   if deployed_sha and live_sha != deployed_sha:
-#       print(f"ERROR: live CodeSha256 ({live_sha}) != Phase B deployed SHA ({deployed_sha})")
-#       print("Another deployment occurred. Investigate before rolling back.")
-#       sys.exit(1)
-#   print(f"Rollback pre-check passed. RevisionId={live_rev}")
-#   PYEOF
+#   ROLLBACK_LIVE_SHA=$(echo "$ROLLBACK_CHECK_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['CodeSha256'])")
+#   ROLLBACK_REV=$(echo "$ROLLBACK_CHECK_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['RevisionId'])")
 #
-#   ROLLBACK_REV=$(aws lambda get-function-configuration \
-#     --function-name screenlake-assign-tcu \
-#     --region us-east-2 \
-#     --query 'RevisionId' --output text)
+#   python3 - <<'PYEOF'
+#   import os, sys
+#   deployed_sha = os.environ.get("DEPLOYED_SHA", "").strip()
+#   live_sha     = os.environ["ROLLBACK_LIVE_SHA"]
+#   # Hard require: DEPLOYED_SHA must be set and must match live function.
+#   # An empty or missing DEPLOYED_SHA means B4 never completed — do not proceed.
+#   if not deployed_sha:
+#       print("ERROR: DEPLOYED_SHA is not set. Run B4 first or set it explicitly.")
+#       print("Cannot verify that the live function is the Phase B deployment.")
+#       sys.exit(1)
+#   if live_sha != deployed_sha:
+#       print(f"ERROR: live CodeSha256 ({live_sha}) != Phase B deployed SHA ({deployed_sha})")
+#       print("Another deployment occurred after Phase B. Investigate before rolling back.")
+#       sys.exit(1)
+#   print(f"Rollback pre-check passed. Live SHA matches Phase B. RevisionId={os.environ['ROLLBACK_REV']}")
+#   PYEOF
 #
 #   aws lambda update-function-code \
 #     --function-name screenlake-assign-tcu \

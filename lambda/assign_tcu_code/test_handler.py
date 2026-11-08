@@ -650,20 +650,73 @@ class FakeDdbClient:
             self._apply(item)
 
     def _check_condition(self, item: dict) -> str | None:
-        """Return 'ConditionalCheckFailed' string if condition fails, else None."""
-        if "Put" in item:
-            op = item["Put"]
-            cond = op.get("ConditionExpression", "")
-            if "attribute_not_exists" in cond:
-                pk = op["Item"]["id"]["S"]
-                if pk in self._tbl.items:
+        """Return 'ConditionalCheckFailed' string if condition fails, else None.
+
+        Handles the subset of DynamoDB condition syntax used by this handler:
+          attribute_exists(id)
+          attribute_not_exists(id)
+          attribute_not_exists(claimed)
+          <field> = :<placeholder>   (equality check against ExpressionAttributeValues)
+          AND combinations of the above
+          (A OR B) sub-expressions — evaluated as a group: passes if any operand passes
+        """
+        op_key = "Put" if "Put" in item else ("Update" if "Update" in item else None)
+        if op_key is None:
+            return None
+        op = item[op_key]
+        cond = op.get("ConditionExpression", "")
+        if not cond:
+            return None
+
+        pk = op["Item"]["id"]["S"] if op_key == "Put" else op["Key"]["id"]["S"]
+        existing = self._tbl.items.get(pk)
+        expr_vals = {k: self._unwrap(v) for k, v in op.get("ExpressionAttributeValues", {}).items()}
+
+        def eval_atom(atom: str) -> bool:
+            """Return True if atom passes, False if it fails."""
+            # Strip whitespace only — parens are part of function names like
+            # attribute_exists(id) and must not be stripped.
+            atom = atom.strip()
+            if "attribute_not_exists(id)" in atom:
+                return existing is None
+            if "attribute_exists(id)" in atom:
+                return existing is not None
+            if "attribute_not_exists(claimed)" in atom:
+                return existing is None or "claimed" not in existing
+            if "=" in atom and "attribute" not in atom:
+                parts = [p.strip() for p in atom.split("=", 1)]
+                if len(parts) == 2:
+                    field, placeholder = parts
+                    if placeholder in expr_vals:
+                        return (existing or {}).get(field) == expr_vals[placeholder]
+            return True  # unknown atom — assume passes
+
+        # Split top-level AND clauses. Parenthesised OR groups stay intact.
+        # Simple tokeniser: split on ' AND ' only when not inside parentheses.
+        and_clauses: list[str] = []
+        depth = 0
+        current: list[str] = []
+        tokens = cond.split(" ")
+        for tok in tokens:
+            depth += tok.count("(") - tok.count(")")
+            if tok == "AND" and depth == 0:
+                and_clauses.append(" ".join(current).strip())
+                current = []
+            else:
+                current.append(tok)
+        if current:
+            and_clauses.append(" ".join(current).strip())
+
+        for clause in and_clauses:
+            clause = clause.strip()
+            # Parenthesised OR group: (A OR B)
+            if clause.startswith("(") and " OR " in clause:
+                inner = clause.strip("()")
+                or_atoms = [a.strip() for a in inner.split(" OR ")]
+                if not any(eval_atom(a) for a in or_atoms):
                     return "ConditionalCheckFailed"
-        if "Update" in item:
-            op = item["Update"]
-            cond = op.get("ConditionExpression", "")
-            if "attribute_exists" in cond:
-                pk = op["Key"]["id"]["S"]
-                if pk not in self._tbl.items:
+            else:
+                if not eval_atom(clause):
                     return "ConditionalCheckFailed"
         return None
 
@@ -1398,3 +1451,157 @@ def test_migrate_no_ddb_write_on_cognito_preflight_failure():
     # user#sub-M must be unchanged
     assert prefills["user#sub-M"]["tcu_code"] == original_code
     assert not prefills["code#RS0006"].get("claimed")
+
+
+# ---------------------------------------------------------------------------
+# Transaction condition enforcement — TOCTOU / concurrent modification tests
+# ---------------------------------------------------------------------------
+
+def test_migrate_transaction_aborts_when_user_code_changed_concurrently():
+    """Transaction condition tcu_code = :old_code prevents double-migration.
+
+    Simulates the TOCTOU window: ownership read returns "1001"; a concurrent
+    caller changes tcu_code to "LF9999" before our transaction fires.
+    Our transaction carries :old_code="1001" but the item now has "LF9999" →
+    condition fails → entire transaction cancels atomically.
+    """
+    prefills = _migration_prefills()
+    fake = FakeTable(prefills=prefills)
+    fake_client = FakeDdbClient(fake)
+
+    # Patch get_item so the ownership read returns the stale snapshot ("1001")
+    # while the items dict already has the concurrently-updated value ("LF9999").
+    original_get_item = fake.get_item
+    def stale_get_item(Key):
+        result = original_get_item(Key)
+        if Key.get("id") == "user#sub-M" and result.get("Item"):
+            stale = dict(result["Item"])
+            stale["tcu_code"] = "1001"   # stale read value
+            # Simultaneously advance the item in the backing store
+            fake.items["user#sub-M"]["tcu_code"] = "LF9999"
+            return {"Item": stale}
+        return result
+    fake.get_item = stale_get_item
+
+    with patch.object(H, "table", fake), \
+         patch("handler.boto3.client", return_value=fake_client):
+        with pytest.raises(H.HandlerError, match="concurrent modification"):
+            H._migrate_researcher_account(
+                "sub-M", "mythubanh@gmail.com", "RS0006", "", "test-caller"
+            )
+
+
+def test_migrate_transaction_aborts_when_user_record_deleted_concurrently():
+    """user#sub deleted between ownership read and transaction — must abort."""
+    prefills = _migration_prefills()
+    fake = FakeTable(prefills=prefills)
+    fake_client = FakeDdbClient(fake)
+
+    # Patch get_item: ownership read returns the user record once, then
+    # it is deleted from the backing store before the transaction fires.
+    original_get_item = fake.get_item
+    def delete_after_read(Key):
+        result = original_get_item(Key)
+        if Key.get("id") == "user#sub-M" and result.get("Item"):
+            # Return the item this time, then remove it for the transaction check
+            del fake.items["user#sub-M"]
+            return result
+        return result
+    fake.get_item = delete_after_read
+
+    with patch.object(H, "table", fake), \
+         patch("handler.boto3.client", return_value=fake_client):
+        with pytest.raises(H.HandlerError, match="concurrent modification|disappeared"):
+            H._migrate_researcher_account(
+                "sub-M", "mythubanh@gmail.com", "RS0006", "", "test-caller"
+            )
+
+
+def test_migrate_transaction_aborts_when_pre_reservation_already_claimed():
+    """pre#email claimed by a different call between read and transaction."""
+    prefills = _migration_prefills()
+    prefills["pre#mythubanh@gmail.com"]["claimed"] = True
+
+    with pytest.raises(H.HandlerError, match="concurrent modification"):
+        _migrate("sub-M", "mythubanh@gmail.com", "RS0006", prefills=prefills)
+
+
+def test_migrate_transaction_aborts_when_pre_reservation_missing():
+    """pre#email deleted between read and transaction — must abort."""
+    prefills = _migration_prefills()
+    del prefills["pre#mythubanh@gmail.com"]
+
+    with pytest.raises(H.HandlerError, match="concurrent modification"):
+        _migrate("sub-M", "mythubanh@gmail.com", "RS0006", prefills=prefills)
+
+
+def test_migrate_transaction_aborts_when_code_lock_claimed_concurrently():
+    """code#RS0006 claimed by a different sub between ownership read and transaction.
+    The ownership read (before the transaction) catches this case and raises.
+    The transaction condition on code#RS0006 also enforces it atomically."""
+    prefills = _migration_prefills()
+    prefills["code#RS0006"]["claimed"] = True
+    prefills["code#RS0006"]["claimed_by_sub"] = "other-sub"
+
+    # Ownership read check fires before the transaction
+    with pytest.raises(H.HandlerError, match="already claimed by sub"):
+        _migrate("sub-M", "mythubanh@gmail.com", "RS0006", prefills=prefills)
+
+
+def test_migrate_transaction_aborts_when_code_lock_email_changed():
+    """code#RS0006 email changed between ownership read and transaction.
+    The ownership read catches this; the transaction condition also enforces it."""
+    prefills = _migration_prefills()
+    prefills["code#RS0006"]["email"] = "other@example.com"
+
+    # Ownership read check fires before the transaction
+    with pytest.raises(H.HandlerError, match="pre-reserved for a different email"):
+        _migrate("sub-M", "mythubanh@gmail.com", "RS0006", prefills=prefills)
+
+
+def test_migrate_transaction_aborts_when_code_lock_no_longer_prereserved():
+    """code#RS0006 pre_reserved flag cleared between ownership read and transaction.
+    The ownership read catches this; the transaction condition also enforces it."""
+    prefills = _migration_prefills()
+    prefills["code#RS0006"]["pre_reserved"] = False
+
+    # Ownership read check fires before the transaction
+    with pytest.raises(H.HandlerError, match="not marked pre_reserved"):
+        _migrate("sub-M", "mythubanh@gmail.com", "RS0006", prefills=prefills)
+
+
+def test_migrate_transaction_no_partial_write_on_concurrent_modification():
+    """When the transaction cancels, none of the three records must be modified.
+
+    Uses the stale-read technique: ownership read sees tcu_code="1001";
+    item is updated to "LF9999" before the transaction fires.
+    Transaction cancels; pre# and code#RS0006 must remain unclaimed.
+    """
+    prefills = _migration_prefills()
+    fake = FakeTable(prefills=prefills)
+    fake_client = FakeDdbClient(fake)
+
+    original_get_item = fake.get_item
+    def stale_get_item(Key):
+        result = original_get_item(Key)
+        if Key.get("id") == "user#sub-M" and result.get("Item"):
+            stale = dict(result["Item"])
+            stale["tcu_code"] = "1001"
+            fake.items["user#sub-M"]["tcu_code"] = "LF9999"
+            return {"Item": stale}
+        return result
+    fake.get_item = stale_get_item
+
+    try:
+        with patch.object(H, "table", fake), \
+             patch("handler.boto3.client", return_value=fake_client):
+            H._migrate_researcher_account(
+                "sub-M", "mythubanh@gmail.com", "RS0006", "", "test-caller"
+            )
+    except H.HandlerError:
+        pass
+
+    # Transaction must have cancelled atomically — no partial writes
+    assert fake.items["user#sub-M"]["tcu_code"] == "LF9999"   # not migrated
+    assert fake.items["pre#mythubanh@gmail.com"].get("claimed") == False
+    assert fake.items["code#RS0006"].get("claimed") == False
