@@ -24,6 +24,7 @@ class ZipFile {
                     val filePath = file.absolutePath
                     try {
                         val entry = ZipEntry(filePath.substring(filePath.lastIndexOf("/") + 1))
+                        entry.time = file.lastModified()
                         out.putNextEntry(entry)
                         var count: Int
                         while (origin.read(data, 0, bufferSize).also { count = it } != -1) {

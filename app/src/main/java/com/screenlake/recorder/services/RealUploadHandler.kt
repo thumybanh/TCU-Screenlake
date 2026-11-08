@@ -188,27 +188,42 @@ class RealUploadHandler @Inject constructor(
      * @return The upload path as a string.
      */
     private fun buildUploadPath(file: File, user: UserEntity?, test: Boolean): String {
-        // `test` arg = explicit unit-test flag (puts files under `test/` prefix).
-        // TEST role (researcher mock accounts) also routes through a `test/`
-        // prefix so research queries can filter by prefix instead of role column.
-        // Real TCU participants land directly under `academia/...`.
-        val isTestRole = com.screenlake.data.UserRolePrefs.isTest(context)
-        val rolePath = if (test || isTestRole) "test/" else ""
+        val isResearcher = com.screenlake.data.UserRolePrefs.isResearcher(context)
         val ext = file.extension
 
+        // RS (researcher) routes to academia/testing/... so S3 queries can filter
+        // by prefix without needing a role column. LF (participant) goes to academia/...
         return if (user?.uploadImages == false) {
-            if (ext == "csv") {
-                "${rolePath}log_events_v2/${user.emailHash}/${getBuildVersion()}/${UUID.randomUUID()}.csv"
+            if (isResearcher) {
+                if (ext == "csv") {
+                    "academia/testing/log_events_v2/${user.emailHash}/${getBuildVersion()}/${UUID.randomUUID()}.csv"
+                } else {
+                    ScreenshotService.lastUploadTime.postValue(System.currentTimeMillis())
+                    "academia/testing/tenant/${user.tenantId}_${user.tenantName}/${getBuildVersion()}/${user.emailHash}/${file.name}"
+                }
             } else {
-                ScreenshotService.lastUploadTime.postValue(System.currentTimeMillis())
-                "${rolePath}tenant/${user.tenantId}_${user.tenantName}/${getBuildVersion()}/${user.emailHash}/${file.name}"
+                if (ext == "csv") {
+                    "log_events_v2/${user.emailHash}/${getBuildVersion()}/${UUID.randomUUID()}.csv"
+                } else {
+                    ScreenshotService.lastUploadTime.postValue(System.currentTimeMillis())
+                    "tenant/${user.tenantId}_${user.tenantName}/${getBuildVersion()}/${user.emailHash}/${file.name}"
+                }
             }
         } else {
-            if (ext == "csv") {
-                "${rolePath}academia/log_events_v2/${user?.emailHash}/${getBuildVersion()}/${UUID.randomUUID()}.csv"
+            if (isResearcher) {
+                if (ext == "csv") {
+                    "academia/testing/log_events_v2/${user?.emailHash}/${getBuildVersion()}/${UUID.randomUUID()}.csv"
+                } else {
+                    ScreenshotService.lastUploadTime.postValue(System.currentTimeMillis())
+                    "academia/testing/tenant/${user?.tenantId}_${user?.tenantName}/panel/${user?.panelId}/${getBuildVersion()}/panelist/${user?.emailHash}/${file.name}"
+                }
             } else {
-                ScreenshotService.lastUploadTime.postValue(System.currentTimeMillis())
-                "${rolePath}academia/tenant/${user?.tenantId}_${user?.tenantName}/panel/${user?.panelId}/${getBuildVersion()}/panelist/${user?.emailHash}/${file.name}"
+                if (ext == "csv") {
+                    "academia/log_events_v2/${user?.emailHash}/${getBuildVersion()}/${UUID.randomUUID()}.csv"
+                } else {
+                    ScreenshotService.lastUploadTime.postValue(System.currentTimeMillis())
+                    "academia/tenant/${user?.tenantId}_${user?.tenantName}/panel/${user?.panelId}/${getBuildVersion()}/panelist/${user?.emailHash}/${file.name}"
+                }
             }
         }
     }

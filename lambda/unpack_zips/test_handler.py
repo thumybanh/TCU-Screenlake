@@ -200,3 +200,70 @@ def test_key_not_matching_layout_is_skipped():
     with patch.object(H, "s3", fake):
         H.process_zip("bucket", "somewhere_else/foo.zip")
     assert fake.puts == []
+
+
+# ---------------------------------------------------------------------------
+# RS researcher ZIP routing — academia/testing/tenant/ paths
+# ---------------------------------------------------------------------------
+
+RS_KEY = "academia/testing/tenant/T_A/panel/general_1/V/panelist/RS0001/image_zip_uuid_2.zip"
+
+
+def _rs_index_from(fake):
+    key = "academia/testing/_manifests/panel=general_1/panelist=RS0001/_index.json"
+    return json.loads(fake.store[key].decode("utf-8"))
+
+
+def test_rs_zip_routes_to_testing_prefix():
+    rows = [{"file": "/dev/img_a.jpg", "apk": "com.a",
+             "id_session": "sess-1", "t_epoch_ts_ms": "1788526805000"}]
+    fake = _run(_build_zip(rows, ["img_a.jpg"]), key=RS_KEY)
+    csv_keys = [p["Key"] for p in fake.puts if p["Key"].endswith(".csv")]
+    assert all(k.startswith("academia/testing/data/") for k in csv_keys), \
+        f"RS CSV not under academia/testing/data/: {csv_keys}"
+
+
+def test_rs_manifest_routes_to_testing_prefix():
+    rows = [{"file": "/dev/img_a.jpg", "apk": "com.a",
+             "id_session": "sess-1", "t_epoch_ts_ms": "1788526805000"}]
+    fake = _run(_build_zip(rows, ["img_a.jpg"]), key=RS_KEY)
+    manifest_keys = [p["Key"] for p in fake.puts if p["Key"].endswith("_index.json")]
+    assert all(k.startswith("academia/testing/_manifests/") for k in manifest_keys), \
+        f"RS manifest not under academia/testing/_manifests/: {manifest_keys}"
+
+
+def test_rs_manifest_has_correct_panelist():
+    rows = [{"file": "/dev/img_a.jpg", "apk": "com.a",
+             "id_session": "sess-1", "t_epoch_ts_ms": "1788526805000"}]
+    fake = _run(_build_zip(rows, ["img_a.jpg"]), key=RS_KEY)
+    index = _rs_index_from(fake)
+    assert index["panelist"] == "RS0001"
+    assert index["panel"] == "general_1"
+
+
+def test_rs_zip_does_not_write_to_lf_data_prefix():
+    rows = [{"file": "/dev/img_a.jpg", "apk": "com.a",
+             "id_session": "sess-1", "t_epoch_ts_ms": "1788526805000"}]
+    fake = _run(_build_zip(rows, ["img_a.jpg"]), key=RS_KEY)
+    lf_writes = [p["Key"] for p in fake.puts
+                 if p["Key"].startswith("data/") or p["Key"].startswith("_manifests/")]
+    assert lf_writes == [], f"RS ZIP wrote to LF tree: {lf_writes}"
+
+
+def test_lf_zip_does_not_write_to_rs_prefix():
+    rows = [{"file": "/dev/img_a.jpg", "apk": "com.a",
+             "id_session": "sess-1", "t_epoch_ts_ms": "1788526805000"}]
+    fake = _run(_build_zip(rows, ["img_a.jpg"]))  # DEFAULT_KEY is LF path
+    rs_writes = [p["Key"] for p in fake.puts if p["Key"].startswith("academia/testing/")]
+    assert rs_writes == [], f"LF ZIP wrote to RS tree: {rs_writes}"
+
+
+def test_rs_idempotent_replay():
+    rows = [{"file": "/dev/img_a.jpg", "apk": "com.a",
+             "id_session": "s1", "t_epoch_ts_ms": "1788526805000"}]
+    fake1 = _run(_build_zip(rows, ["img_a.jpg"]), key=RS_KEY)
+    index_key = "academia/testing/_manifests/panel=general_1/panelist=RS0001/_index.json"
+    fake2 = _run(_build_zip(rows, ["img_a.jpg"]), key=RS_KEY,
+                 prefills={k: v for k, v in fake1.store.items()})
+    # Second run is a no-op — index unchanged
+    assert json.loads(fake1.store[index_key]) == json.loads(fake2.store[index_key])

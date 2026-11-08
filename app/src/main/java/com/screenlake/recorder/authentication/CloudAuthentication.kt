@@ -91,12 +91,11 @@ class CloudAuthentication @Inject constructor(
      * @param password The password.
      */
     fun signUp(password: String, context: Context) {
-        // Pass the participant's 4-digit code to the PreSignUp Lambda trigger via
-        // clientMetadata. The Lambda rejects the signup if the code does not match
-        // the researcher's pre-reservation for this email.
+        // PreSignUp Lambda validates the email is on the researcher's pre-reservation
+        // list. No enrollment code is required from the participant — email
+        // ownership is separately verified by Cognito's email verification step.
         val options = AWSCognitoAuthSignUpOptions.builder()
             .userAttribute(AuthUserAttributeKey.email(), amplifyRepository.email)
-            .clientMetadata(mapOf("panel_code" to amplifyRepository.code))
             .build()
 
         Amplify.Auth.signUp(amplifyRepository.email, password, options,

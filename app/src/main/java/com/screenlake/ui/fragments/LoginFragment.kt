@@ -278,7 +278,9 @@ class LoginFragment : Fragment() {
 
     private suspend fun getUserFromDatastore(email: String): UserEntity? {
         return try {
-            UserEntity(email = email)
+            val now = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+                .format(java.util.Date())
+            UserEntity(email = email, createdTimestamp = now)
         } catch (error: ApiException) {
             saveLog("Exception", error.stackTraceToString())
             Timber.e(error)

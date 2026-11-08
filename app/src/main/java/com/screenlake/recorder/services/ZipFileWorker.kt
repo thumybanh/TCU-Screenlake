@@ -146,6 +146,28 @@ class ZipFileWorker @AssistedInject constructor(
 
         if (screenshotCount > 0) {
             userObj = userObj ?: withContext(Dispatchers.IO) { generalOperationsRepository.getUser() }
+
+            // Require a fully-validated RS#### or LF#### ID before creating any ZIP.
+            // Legacy bare-numeric IDs (e.g. "1001") are rejected — they predate the
+            // RS/LF prefix scheme and must not appear in ZIP filenames or S3 paths.
+            // If the ID is absent or invalid, leave all screenshots in the DB untouched;
+            // the next ZipFileWorker run will proceed once UploadWorker.syncTcuCodeFromCognito()
+            // has written the correct prefixed code into user.emailHash.
+            val userEmailHash = userObj?.emailHash
+            val validId = userEmailHash != null && (
+                userEmailHash.matches(Regex("^RS\\d{4}$"))
+                || userEmailHash.matches(Regex("^LF[1-9]\\d{3}$"))
+            )
+            if (!validId) {
+                val reason = when {
+                    userEmailHash.isNullOrBlank() -> "emailHash is blank"
+                    else -> "emailHash '$userEmailHash' is not a valid RS#### or LF#### ID"
+                }
+                Timber.tag(TAG).w("Deferring ZIP creation: $reason — screenshots preserved in DB.")
+                generalOperationsRepository.saveLog("ZIP_WORKER_DEFERRED_INVALID_ID $runId", reason)
+                return
+            }
+
             var hasMoreScreenshots = true
 
             // Loop until all screenshots are processed
@@ -162,15 +184,19 @@ class ZipFileWorker @AssistedInject constructor(
                     generalOperationsRepository.saveLog(log1)
                     Timber.tag(TAG).d(log1)
 
+                    // Prefix ZIP filename with the user's full assigned ID (e.g. RS0006 or LF4821).
+                    // userEmailHash is non-null/non-blank here — guarded above.
+                    val zipFileName = "${userEmailHash}_image_zip_${zipFileId}_${screenshots.size}.zip"
+
                     findDuplicates(screenshots, zipFileId)
 
                     processAccessibilityEvents(screenshots, path, zipFileId, toZip)
-                    processScreenshots(screenshots, path, zipFileId, toZip)
+                    processScreenshots(screenshots, path, zipFileId, toZip, zipFileName)
                     processSessions(screenshots, path, zipFileId, toZip)
                     processAppSegments(screenshots, path, zipFileId, toZip)
 
                     // Create zip file for this batch
-                    createZipFile(toZip, path, zipFileId, screenshots)
+                    createZipFile(toZip, path, zipFileId, screenshots, zipFileName)
 
                     // Update lastProcessedId for next batch instead of using offset
                     lastProcessedId = screenshots.lastOrNull()?.id
@@ -263,14 +289,16 @@ class ZipFileWorker @AssistedInject constructor(
      * @param path The path where the CSV should be saved.
      * @param zipFileId The unique identifier for the zip file.
      * @param toZip The list of files to be included in the zip.
+     * @param zipFileName The final ZIP filename (may include ID prefix).
      */
     private fun processScreenshots(
         screenshots: List<ScreenshotEntity>,
         path: String,
         zipFileId: UUID,
-        toZip: MutableList<File>
+        toZip: MutableList<File>,
+        zipFileName: String = "image_zip_${zipFileId}_${screenshots.size}.zip"
     ) {
-        screenshots.forEach { it.zipFileId = "image_zip_${zipFileId}_${screenshots.size}.zip" }
+        screenshots.forEach { it.zipFileId = zipFileName }
 
         val screenshotCsv = DataTransformation.createScreenshotCsv(screenshots)
         val screenshotCSVFile = "screenshot_data_csv_${zipFileId}.csv"
@@ -349,9 +377,14 @@ class ZipFileWorker @AssistedInject constructor(
      * @param zipFileId The unique identifier for the zip file.
      * @param screenshotCount The number of screenshots included in the zip.
      */
-    private fun createZipFile(toZip: MutableList<File>, path: String, zipFileId: UUID, screenshots: List<ScreenshotEntity>) {
-        val screenshotCount = screenshots.size
-        val zipFile = File(path, "image_zip_${zipFileId}_${screenshotCount}.zip")
+    private fun createZipFile(
+        toZip: MutableList<File>,
+        path: String,
+        zipFileId: UUID,
+        screenshots: List<ScreenshotEntity>,
+        zipFileName: String = "image_zip_${zipFileId}_${screenshots.size}.zip"
+    ) {
+        val zipFile = File(path, zipFileName)
         ZipFile().zip(zipFile, toZip)
 
         val zipObj = ScreenshotZipEntity().apply {

@@ -19,23 +19,31 @@ If you get stuck at any step, screenshot the problem and email the researcher.
 
 ## Step 1 — Download the app
 
-1. On your phone, open the **OneDrive link** the researcher emailed you.
-2. Tap the file `app-debug.apk` to download it. (Should take 10–30 seconds.)
-3. When download finishes, tap the file to open it.
+> **Already have the app installed?** Skip to [Getting app updates](#getting-app-updates) below.
+
+1. On your **Android phone**, open the invitation email from the researcher.
+   The subject line is: **"You've been invited to test TCU Screenlake"**
+2. Tap **Accept invitation** in the email.
+   - You will be prompted to install **Firebase App Tester** — tap Install and follow the prompts.
+   - After App Tester installs, it will open automatically and show TCU Screenlake.
+3. Tap **Download** (or **Install**) in App Tester to install TCU Screenlake.
+
+> **Important:** The "Accept invitation" button only works when you open the email **on your Android phone**. Opening it on a desktop/laptop and tapping the link will not work.
 
 ---
 
 ## Step 2 — Install the app
 
-Android will show a warning: _"For your security, your phone is not allowed to install unknown apps from this source."_
+After tapping **Download** in App Tester, Android may show a warning:
 
+> _"For your security, your phone is not allowed to install unknown apps from this source."_
+
+If you see it:
 1. Tap **Settings** on the warning.
-2. Enable the toggle **Allow from this source**.
-3. Tap the back button, then tap **Install** on the install screen.
-4. Wait for install to finish (10–20 seconds).
-5. Tap **Open** when done.
+2. Enable **Allow from this source**.
+3. Tap back, then tap **Install**.
 
-If Google Play Protect shows a warning ("App not scanned" or "Unsafe app"), tap **Install anyway** — this is normal for research apps that aren't distributed through the Play Store.
+If Google Play Protect shows a warning ("App not scanned" or "Unsafe app"), tap **Install anyway** — normal for research apps not on the Play Store.
 
 ---
 
@@ -142,6 +150,20 @@ Your phone will capture a screenshot every 5 seconds while you use it. You can c
 - Nothing uploads over cellular data. Nothing uploads if your phone is unplugged.
 
 To make sure data flows, **plug your phone in while on WiFi** at least once per day (overnight charging is ideal).
+
+---
+
+---
+
+## Getting app updates
+
+When the researcher pushes a new version, you'll receive a **push notification** from Firebase App Tester.
+
+1. Tap the notification (or open the **App Tester** app).
+2. Tap **Update** next to TCU Screenlake.
+3. The new version installs over the old one — no data loss, no need to sign in again.
+
+You don't need to do anything else. Your login, permissions, and recorded data are all preserved.
 
 ---
 

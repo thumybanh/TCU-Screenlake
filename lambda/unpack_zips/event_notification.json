@@ -1,7 +1,7 @@
 {
   "LambdaFunctionConfigurations": [
     {
-      "Id": "unpack-academia-zips",
+      "Id": "unpack-lf-zips",
       "LambdaFunctionArn": "arn:aws:lambda:us-east-2:951662621099:function:screenlake-unpack-zips",
       "Events": [
         "s3:ObjectCreated:*"
@@ -12,6 +12,27 @@
             {
               "Name": "prefix",
               "Value": "academia/tenant/"
+            },
+            {
+              "Name": "suffix",
+              "Value": ".zip"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "Id": "unpack-rs-zips",
+      "LambdaFunctionArn": "arn:aws:lambda:us-east-2:951662621099:function:screenlake-unpack-zips",
+      "Events": [
+        "s3:ObjectCreated:*"
+      ],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {
+              "Name": "prefix",
+              "Value": "academia/testing/tenant/"
             },
             {
               "Name": "suffix",

@@ -108,6 +108,8 @@ class ScreenshotService : Service(), ScreenStateReceiver.ScreenStateCallback {
 
         var lastUploadSuccessful = MutableLiveData<Boolean>()
         var lastUploadTime = MutableLiveData<Long>()
+        val pendingScreenshots = MutableLiveData<Int>()
+        val pendingZips = MutableLiveData<Int>()
 
         val isMaintenanceOccurring = MutableLiveData<Boolean>()
 

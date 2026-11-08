@@ -200,6 +200,9 @@ class ScreenCollector @Inject constructor(
         val zipCount = generalOperationsRepository.getZipCount()
         val screenshotCount = zipCount * ConstantSettings.getBatch()
         ScreenshotService.notUploaded.postValue(screenshotCount)
+        ScreenshotService.pendingZips.postValue(zipCount)
+        val pendingShots = runCatching { generalOperationsRepository.getZippableScreenshotCount() }.getOrDefault(0)
+        ScreenshotService.pendingScreenshots.postValue(pendingShots)
     }
 
     /**

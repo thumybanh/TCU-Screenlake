@@ -21,8 +21,8 @@ android {
         applicationId = "com.screenlake"
         minSdk = 28
         targetSdk = 35
-        versionCode = 47
-        versionName = "1.39"
+        versionCode = 51
+        versionName = "1.43"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -72,7 +72,7 @@ android {
 
             firebaseAppDistribution {
                 serviceCredentialsFile = "${rootProject.projectDir}/firebase-service-account.json"
-                testers = "mythubanh@gmail.com"
+                testers = project.findProperty("distTesters") as? String ?: "mythubanh@gmail.com"
                 releaseNotesFile = "${rootProject.projectDir}/release-notes.txt"
             }
         }
@@ -95,7 +95,7 @@ android {
 
             firebaseAppDistribution {
                 serviceCredentialsFile = "${rootProject.projectDir}/firebase-service-account.json"
-                testers = "mythubanh@gmail.com"
+                testers = project.findProperty("distTesters") as? String ?: "mythubanh@gmail.com"
                 releaseNotesFile = "${rootProject.projectDir}/release-notes.txt"
             }
         }

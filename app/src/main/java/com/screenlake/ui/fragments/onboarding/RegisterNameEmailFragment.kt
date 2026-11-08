@@ -77,43 +77,12 @@ class RegisterNameEmailFragment : Fragment() {
 //            findNavController().navigate(R.id.goToTermsOfService)
 //        }
 
-        binding.loginPanelConfirmationlFragmentEmail.addTextChangedListener(object :
-            TextWatcher {
-            override fun afterTextChanged(s: Editable?) {
-                val code = binding.loginPanelConfirmationlFragmentEmail.text.toString()
-                if (validateCode(code)) {
-                    binding.loginPanelConfirmationlFragmentEmail.error = null
-                } else {
-                    binding.loginPanelConfirmationlFragmentEmail.error =
-                        getString(R.string.invalid_code_please_enter_a_4_digit_code_between_0000_and_9999)
-                }
-            }
-
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-        })
-
         binding.registerNameEmailFragmentNext.setOnClickListener {
             hideKeyboard()
             lifecycleScope.launch {
                 if (HardwareChecks.isConnected(requireContext())) {
                     email = binding.registerNameEmailFragmentEmail.text.toString().trim()
                         .lowercase(Locale.getDefault())
-
-                    val enteredCode = binding.loginPanelConfirmationlFragmentEmail.text?.toString()?.trim()
-                    if(enteredCode.isNullOrBlank()) {
-                        binding.loginPanelConfirmationlFragmentEmail.error =
-                            getString(R.string.confirmation_code_cannot_be_empty)
-                        return@launch
-                    }
-
-                    if(!validateCode(enteredCode)) {
-                        binding.loginPanelConfirmationlFragmentEmail.error =
-                            getString(R.string.code_invalid)
-                        return@launch
-                    }
-
-                    amplifyRepository.code = enteredCode
 
                     if (binding.checkBox1.isChecked && binding.checkBox2.isChecked) {
                         userExist.postValue(false)
@@ -150,14 +119,12 @@ class RegisterNameEmailFragment : Fragment() {
     }
 
     fun validateCode(code: String): Boolean {
-        if (code.length != 4) {
-            return false
-        }
-        if (!code.all { it.isDigit() }) {
-            return false
-        }
-        val numericCode = code.toInt()
-        return numericCode in 0..9999
+        // LF4342 — participant: LF + 4 digits, first digit 1-9 (range 1000-9999, no leading zero)
+        // RS0001 — researcher: RS + 4 digits, zero-padded sequential
+        // 1234   — legacy 4-digit numeric codes from accounts before the rename
+        return code.matches(Regex("^LF[1-9]\\d{3}$"))
+            || code.matches(Regex("^RS\\d{4}$"))
+            || (code.length == 4 && code.all { it.isDigit() })
     }
 
     private fun emailConfirmed(email: String) {

@@ -184,7 +184,15 @@ class UploadWorker @AssistedInject constructor(
             val code = attrs.firstOrNull { it.key.keyString == "custom:tcu_code" }?.value
             val role = attrs.firstOrNull { it.key.keyString == "custom:tcu_role" }?.value
 
-            if (code.isNullOrBlank() || !code.matches(Regex("\\d{4}"))) {
+            // Accept LF4342 (participant), RS0001 (researcher), or legacy 1234 (4-digit).
+            // The old \d{4} pattern silently rejected LF/RS codes, leaving emailHash
+            // stale and all uploads going to the wrong S3 path after an ID migration.
+            val validCode = code != null && (
+                code.matches(Regex("^LF[1-9]\\d{3}$"))
+                || code.matches(Regex("^RS\\d{4}$"))
+                || (code.length == 4 && code.all { it.isDigit() })
+            )
+            if (code.isNullOrBlank() || !validCode) {
                 Timber.tag(TAG).w("No valid custom:tcu_code attribute on Cognito user; sync skipped.")
                 return
             }

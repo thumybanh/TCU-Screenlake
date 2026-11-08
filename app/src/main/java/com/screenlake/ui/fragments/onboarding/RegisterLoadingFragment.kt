@@ -57,6 +57,8 @@ class RegisterLoadingFragment : Fragment() {
         // and populate `user.emailHash` from that attribute — never from what
         // the participant typed. This prevents an incorrect typed code from
         // ever reaching S3 as a `panelist/<code>/` path.
+        val now = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date())
         val user = UserEntity(
             email = amplifyRepository.email,
             emailHash = null,
@@ -64,7 +66,8 @@ class RegisterLoadingFragment : Fragment() {
             sdk = Build.VERSION.SDK,
             device = Build.DEVICE,
             product = Build.PRODUCT,
-            isEmulator = Build.MODEL.contains("Emulator")
+            isEmulator = Build.MODEL.contains("Emulator"),
+            createdTimestamp = now
         )
 
         setUpUser(user)

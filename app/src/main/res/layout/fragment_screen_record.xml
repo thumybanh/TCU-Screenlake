@@ -186,6 +186,79 @@
                 android:layout_width="match_parent"
                 android:layout_height="1dp"
                 android:background="@color/screenlake_lighter_gray" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:gravity="center">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Pending shots"
+                        android:textColor="@color/screenlake_light_gray"
+                        android:textSize="11sp"
+                        android:fontFamily="@font/inter_light" />
+
+                    <TextView
+                        android:id="@+id/textPendingScreenshots"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="—"
+                        android:textColor="#000000"
+                        android:textSize="14sp"
+                        android:fontFamily="@font/inter_semibold"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <ImageView
+                    android:layout_width="1dp"
+                    android:layout_height="match_parent"
+                    android:background="@color/screenlake_lighter_gray" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:gravity="center">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Pending zips"
+                        android:textColor="@color/screenlake_light_gray"
+                        android:textSize="11sp"
+                        android:fontFamily="@font/inter_light" />
+
+                    <TextView
+                        android:id="@+id/textPendingZips"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="—"
+                        android:textColor="#000000"
+                        android:textSize="14sp"
+                        android:fontFamily="@font/inter_semibold"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+            </LinearLayout>
+
+            <ImageView
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="@color/screenlake_lighter_gray" />
         </LinearLayout>
 
         <LinearLayout
@@ -285,7 +358,7 @@
             android:id="@+id/tvUpdates"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginBottom="76dp"
+            android:visibility="gone"
             android:text=""
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
@@ -306,6 +379,7 @@
             android:id="@+id/tvUpdatesUpload"
             android:layout_width="match_parent"
             android:layout_height="61dp"
+            android:visibility="gone"
             android:textSize="16sp"
             app:layout_constraintBottom_toTopOf="@+id/tvUpdates"
             app:layout_constraintTop_toBottomOf="@+id/button2"

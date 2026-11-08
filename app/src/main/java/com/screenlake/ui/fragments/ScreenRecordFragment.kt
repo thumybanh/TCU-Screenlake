@@ -379,6 +379,12 @@ class ScreenRecordFragment : Fragment(R.layout.fragment_screen_record), EasyPerm
         lifecycleScope.launch {
             HardwareChecks.isConnectedAsync(WeakReference(requireContext()))
         }
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val pendingShots = runCatching { generalOperationsRepository.getZippableScreenshotCount() }.getOrDefault(0)
+            val pendingZips = runCatching { generalOperationsRepository.getZipCount() }.getOrDefault(0)
+            ScreenshotService.pendingScreenshots.postValue(pendingShots)
+            ScreenshotService.pendingZips.postValue(pendingZips)
+        }
     }
 
     private fun checkConnectionStatus(): Boolean {
@@ -495,6 +501,14 @@ class ScreenRecordFragment : Fragment(R.layout.fragment_screen_record), EasyPerm
 
         ScreenshotService.notUploaded.observe(viewLifecycleOwner, Observer {
             binding.textBoxTwo.text = it.toString()
+        })
+
+        ScreenshotService.pendingScreenshots.observe(viewLifecycleOwner, Observer {
+            binding.textPendingScreenshots.text = it.toString()
+        })
+
+        ScreenshotService.pendingZips.observe(viewLifecycleOwner, Observer {
+            binding.textPendingZips.text = it.toString()
         })
 
         ScreenshotService.uploadCountMsg.observe(viewLifecycleOwner, Observer {
@@ -710,11 +724,26 @@ class ScreenRecordFragment : Fragment(R.layout.fragment_screen_record), EasyPerm
             val attrs = com.amplifyframework.kotlin.core.Amplify.Auth.fetchUserAttributes()
             val value = attrs.firstOrNull { it.key.keyString == "custom:tcu_code" }?.value
             val role = attrs.firstOrNull { it.key.keyString == "custom:tcu_role" }?.value
+            val assignedAtEpoch = attrs.firstOrNull { it.key.keyString == "custom:assigned_at" }?.value
             if (!value.isNullOrBlank() && validateCode(value)) {
-                // Cache the role alongside the code so RealUploadHandler can
-                // decide the S3 prefix without an extra Cognito call per upload.
                 context?.applicationContext?.let { ctx ->
                     com.screenlake.data.UserRolePrefs.setRole(ctx, role)
+                }
+                // Backfill account creation date from Cognito if not yet stored locally.
+                if (!assignedAtEpoch.isNullOrBlank()) {
+                    val user = userDao.getUser()
+                    if (user != null) {
+                        val epochMs = assignedAtEpoch.toLongOrNull()?.times(1000)
+                        if (epochMs != null) {
+                            user.createdTimestamp = java.text.SimpleDateFormat(
+                                "yyyy-MM-dd HH:mm:ss", java.util.Locale.US
+                            ).format(java.util.Date(epochMs))
+                            userDao.insertUserObj(user)
+                            // Clear stale SharedPreferences cache so Profile shows Cognito date.
+                            context?.applicationContext?.getSharedPreferences("profile_prefs", android.content.Context.MODE_PRIVATE)
+                                ?.edit()?.remove("first_seen_date")?.apply()
+                        }
+                    }
                 }
                 value
             } else null
@@ -852,32 +881,24 @@ class ScreenRecordFragment : Fragment(R.layout.fragment_screen_record), EasyPerm
     }
 
     private fun showMissingIdDialog() {
-        // Get the layout inflater
         val context = this@ScreenRecordFragment.requireContext()
-        val inflater = context.getSystemService(Context.LAYOUT_INFLATER_SERVICE) as LayoutInflater
-        val dialogView = inflater.inflate(R.layout.dialog_missing_id, null)
-
-        // Get the EditText from the inflated view
-        val codeEditText = dialogView.findViewById<EditText>(R.id.codeEditText)
-
-        // Build the dialog
-        val builder = AlertDialog.Builder(context)
-            .setTitle("Participant ID")
-            .setMessage("Enter the 4-digit code your researcher assigned. Your ID will look like TCU-XXXX.")
+        // Do NOT offer a manual code-entry field. The participant ID must come
+        // from custom:tcu_code on the Cognito account — set by the researcher's
+        // pre-reservation flow. Accepting a typed code would let a participant
+        // upload under an arbitrary S3 path they chose, breaking attribution.
+        AlertDialog.Builder(context)
+            .setTitle("Account setup in progress")
+            .setMessage(
+                "Your participant ID is being set up. Make sure you are connected to the internet, " +
+                "then tap Retry. If this keeps happening, contact your researcher."
+            )
             .setPositiveButton("Retry") { dialog, _ ->
-                // The TCU code can ONLY be sourced from the Cognito
-                // `custom:tcu_code` attribute set by the researcher's
-                // pre-reservation flow. We never accept a locally-typed code
-                // as a substitute: that would let a participant upload under
-                // an arbitrary panelist path they chose themselves, which
-                // breaks researcher attribution. Instead, re-attempt the sync
-                // via the standard start-recording flow.
                 lifecycleScope.launch {
                     val fetched = tryFetchTcuCodeFromCognito()
                     if (fetched.isNullOrBlank()) {
                         Toast.makeText(
                             context,
-                            "Could not fetch your Participant ID. Make sure you are online and signed in, then contact your researcher if the problem persists.",
+                            "Still waiting for setup. Check your internet connection and try again in a moment.",
                             Toast.LENGTH_LONG
                         ).show()
                     } else {
@@ -885,30 +906,22 @@ class ScreenRecordFragment : Fragment(R.layout.fragment_screen_record), EasyPerm
                         user.emailHash = fetched
                         userDao.insertUserObj(user)
                         ScreenshotService.user = user
-                        Toast.makeText(context, "Participant ID: TCU-$fetched", Toast.LENGTH_SHORT).show()
                         dialog.dismiss()
+                        toggleRecording()
                     }
                 }
             }
-            .setNegativeButton("Cancel") { dialog, _ ->
-                dialog.dismiss()
-            }
-            .setView(dialogView)
-
-
-        // Show the dialog
-        builder.create().show()
+            .setNegativeButton("Cancel") { dialog, _ -> dialog.dismiss() }
+            .show()
     }
 
     fun validateCode(code: String): Boolean {
-        if (code.length != 4) {
-            return false
-        }
-        if (!code.all { it.isDigit() }) {
-            return false
-        }
-        val numericCode = code.toInt()
-        return numericCode in 0..9999
+        // LF4342 — participant: LF + 4 digits, first digit 1-9 (range 1000-9999, no leading zero)
+        // RS0001 — researcher: RS + 4 digits, zero-padded sequential
+        // 1234   — legacy 4-digit numeric codes from accounts before the rename
+        return code.matches(Regex("^LF[1-9]\\d{3}$"))
+            || code.matches(Regex("^RS\\d{4}$"))
+            || (code.length == 4 && code.all { it.isDigit() })
     }
 
     companion object {

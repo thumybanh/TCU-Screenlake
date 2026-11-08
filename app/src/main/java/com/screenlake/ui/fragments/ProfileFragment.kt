@@ -14,15 +14,11 @@ import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.fragment.findNavController
-import com.amplifyframework.core.Amplify
 import com.screenlake.BuildConfig
 import com.screenlake.R
 import com.screenlake.data.UserRolePrefs
-import com.screenlake.data.database.dao.ScreenshotDao
-import com.screenlake.data.database.dao.ScreenshotZipDao
 import com.screenlake.data.database.dao.UserDao
 import com.screenlake.data.repository.AwsService
-import com.screenlake.recorder.services.ScreenshotService
 import com.screenlake.recorder.upload.Util
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
@@ -43,8 +39,6 @@ import javax.inject.Inject
 class ProfileFragment : Fragment() {
 
     @Inject lateinit var userDao: UserDao
-    @Inject lateinit var screenshotDao: ScreenshotDao
-    @Inject lateinit var screenshotZipDao: ScreenshotZipDao
     @Inject lateinit var awsService: AwsService
 
     override fun onCreateView(
@@ -58,10 +52,6 @@ class ProfileFragment : Fragment() {
         view.findViewById<Button>(R.id.profileReportIssueButton).setOnClickListener {
             showReportIssueDialog()
         }
-
-        view.findViewById<Button>(R.id.profileSignOutButton).setOnClickListener {
-            signOut()
-        }
     }
 
     override fun onResume() {
@@ -72,12 +62,6 @@ class ProfileFragment : Fragment() {
     private fun loadProfile(root: View) {
         lifecycleScope.launch {
             val user = withContext(Dispatchers.IO) { userDao.getUser() }
-            val pendingShots = withContext(Dispatchers.IO) {
-                runCatching { screenshotDao.getTotalCount() }.getOrDefault(0)
-            }
-            val pendingZips = withContext(Dispatchers.IO) {
-                runCatching { screenshotZipDao.getCount() }.getOrDefault(0)
-            }
 
             val ctx = context?.applicationContext ?: return@launch
             val role = UserRolePrefs.getRole(ctx)
@@ -87,12 +71,12 @@ class ProfileFragment : Fragment() {
                 UserRolePrefs.formatDisplayCode(code, role)
             root.findViewById<TextView>(R.id.profileRole).text = UserRolePrefs.displayRole(role)
             root.findViewById<TextView>(R.id.profileEmail).text = user?.email ?: "unknown"
-            root.findViewById<TextView>(R.id.profileDevice).text =
-                listOfNotNull(user?.model, user?.product).joinToString(" / ").ifBlank { "unknown" }
-            root.findViewById<TextView>(R.id.profilePendingCount).text = pendingShots.toString()
-            root.findViewById<TextView>(R.id.profilePendingZips).text = pendingZips.toString()
-            root.findViewById<TextView>(R.id.profileSignedInSince).text =
-                user?.createdAt ?: user?.createdTimestamp ?: "unknown"
+            val deviceName = user?.model?.ifBlank { null }
+                ?: com.screenlake.recorder.utilities.BaseUtility.getDeviceName()
+            root.findViewById<TextView>(R.id.profileDevice).text = deviceName ?: "unknown"
+            val signedInSince = user?.createdAt ?: user?.createdTimestamp
+                ?: getOrSetFirstSeenDate(ctx)
+            root.findViewById<TextView>(R.id.profileSignedInSince).text = signedInSince
             root.findViewById<TextView>(R.id.profileLastUpload).text = formatLastUpload()
             root.findViewById<TextView>(R.id.profileAppVersion).text =
                 "${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})"
@@ -100,9 +84,21 @@ class ProfileFragment : Fragment() {
     }
 
     private fun formatLastUpload(): String {
-        val millis = ScreenshotService.lastUploadTime.value ?: 0L
+        val millis = com.screenlake.recorder.services.ScreenshotService.lastUploadTime.value ?: 0L
         if (millis <= 0L) return "never"
         return SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(millis))
+    }
+
+    /** Returns the stored first-seen date, or records today and returns it.
+     * Used as a fallback for accounts registered before createdTimestamp was set. */
+    private fun getOrSetFirstSeenDate(context: android.content.Context): String {
+        val prefs = context.getSharedPreferences("profile_prefs", android.content.Context.MODE_PRIVATE)
+        val key = "first_seen_date"
+        val stored = prefs.getString(key, null)
+        if (stored != null) return stored
+        val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        prefs.edit().putString(key, now).apply()
+        return now
     }
 
     /** Opens an inline dialog with a text area + submit button. On submit, the
@@ -171,9 +167,14 @@ class ProfileFragment : Fragment() {
             put("description", description)
         }
 
-        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-        val uuid = UUID.randomUUID().toString()
-        val uploadPath = "reports/$today/${role}-${code}/$uuid.json"
+        val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+        val uuid = UUID.randomUUID().toString().take(8)
+        val participantFolder = "${role}${code}"
+        val uploadPath = if (UserRolePrefs.isResearcher(ctx)) {
+            "academia/testing/reports/$participantFolder/${timestamp}_${uuid}.json"
+        } else {
+            "academia/reports/$participantFolder/${timestamp}_${uuid}.json"
+        }
 
         // Write to a temp file because the existing S3 presign helper looks
         // up MIME type from the file extension. Delete after the PUT completes.
@@ -199,22 +200,4 @@ class ProfileFragment : Fragment() {
         }
     }
 
-    private fun signOut() {
-        val ctx = context?.applicationContext ?: return
-        Amplify.Auth.signOut(
-            {
-                requireActivity().runOnUiThread {
-                    Toast.makeText(ctx, "Signed out", Toast.LENGTH_SHORT).show()
-                    try {
-                        findNavController().navigate(R.id.registerOrLoginFragment)
-                    } catch (_: Exception) { /* nav graph may not expose it as action */ }
-                }
-            },
-            { error ->
-                requireActivity().runOnUiThread {
-                    Toast.makeText(ctx, "Sign out failed: ${error.message}", Toast.LENGTH_LONG).show()
-                }
-            }
-        )
-    }
 }

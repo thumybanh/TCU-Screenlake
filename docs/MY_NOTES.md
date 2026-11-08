@@ -212,6 +212,78 @@ For the tobacco study specifically: keyword matching on main content text works 
 
 ---
 
+## 2026-11-07 / 2026-11-08 Session — Issues & Fixes
+
+### Problems hit and fixes
+
+1. **Build failure — Java 25 incompatible with Kotlin**
+   Gradle failed with `IllegalArgumentException: 25`. Fix: `JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home ./gradlew assembleDebug`.
+
+2. **UploadWorker silently rejected LF/RS codes after ID migration**
+   Regex `\d{4}` only matched legacy 4-digit codes. New `LF####` / `RS####` codes failed validation, leaving `emailHash` stale in Room DB forever — all uploads went to wrong S3 path.
+   Fix: updated regex to accept `^LF[1-9]\d{3}$`, `^RS\d{4}$`, and legacy 4-digit. Also fixed a Kotlin null-safety crash on `code.matches()`.
+
+3. **Cognito app client missing ReadAttributes — role and assigned_at never reached the app**
+   `custom:tcu_role` and `custom:assigned_at` were not in the app client `ReadAttributes` list. Amplify silently dropped them on every `fetchUserAttributes()` call. The app never knew the user's role and always fell back to LF (default), meaning RS users uploaded to the wrong S3 prefix.
+   Fix: added both attributes to `ReadAttributes` via `aws cognito-idp update-user-pool-client`.
+
+4. **All researcher accounts had legacy role `TEST` instead of `RS`**
+   All 6 researcher accounts had `custom:tcu_role = TEST` (name before the RS/LF rename). The app normalizes `TEST → RS` internally, but Cognito should store canonical values.
+   Fix: bulk-updated all 6 accounts to `RS` via `admin-update-user-attributes`. Deleted `zenamy51@gmail.com` (no longer needed).
+
+5. **"Signed in since" showed wrong date (Nov 8 instead of Oct 5)**
+   Root causes (chain of issues):
+   - `LoginFragment` created `UserEntity` with no timestamp on fresh install
+   - `getOrSetFirstSeenDate()` cached today's date in SharedPreferences on first open
+   - `custom:assigned_at` Cognito attribute didn't exist yet
+   - Even after adding it, it wasn't readable (see issue #3 above)
+   Fix: added `custom:assigned_at` to Cognito user pool schema; wrote Oct 5 epoch for existing accounts; updated Lambda to write it for all future accounts; app now reads and backfills `UserEntity.createdTimestamp` from it on record button tap; SharedPreferences cache cleared when backfill succeeds.
+
+6. **Firebase App Distribution — wrong tester group name**
+   `build.gradle.kts` defaulted to group `"participants"` which doesn't exist in Firebase. APK uploaded but was distributed to nobody.
+   Fix: changed to `testers = "mythubanh@gmail.com"` for direct targeted distribution.
+
+7. **Mystery gray number on recording screen**
+   `tvUpdates` (uploadCountMsg) was visible at the bottom with no label — just a floating gray number.
+   Fix: set `visibility="gone"` on `tvUpdates` and `tvUpdatesUpload`.
+
+8. **Pending shots / pending zips showed `—` on home screen**
+   LiveData only got posted during active recording. Values never appeared when just viewing the home screen.
+   Fix: added DB query in `ScreenRecordFragment.onResume()` to post counts immediately on every screen open.
+
+### New features added
+
+- **Pending shots + pending zips on recording screen** — updates live during recording and on every resume
+- **Last successful upload timestamp on Profile tab** — full `yyyy-MM-dd HH:mm:ss`
+- **Bug report email notifications** — S3 → SNS → email. Created SNS topic `screenlake-bug-reports`, wired to `academia/reports/**/*.json` and `academia/testing/reports/**/*.json`. `mythubanh@gmail.com` subscribed. Setup script: `lambda/setup_report_notifications.sh`.
+
+### AWS changes made
+
+| Resource | Change |
+|----------|--------|
+| Cognito user pool | Added `custom:assigned_at` to schema |
+| Cognito app client | Added `custom:tcu_role`, `custom:assigned_at` to ReadAttributes |
+| Cognito users (5) | Updated `custom:tcu_role` TEST → RS (mythubanh, jgcordova07, jessie, jacksonberger518, kclockton) |
+| Cognito user | Deleted `zenamy51@gmail.com` |
+| Cognito user (mythubanh) | Set `email_verified = true`, wrote `custom:assigned_at = 1791177470` (Oct 5) |
+| SNS | Created topic `screenlake-bug-reports`, subscribed `mythubanh@gmail.com` |
+| S3 (tcu-bucket) | Added two SNS event rules for report JSON files |
+
+### App versions released
+
+| Version | Build | Key changes |
+|---------|-------|-------------|
+| 1.40 | 48 | Pending stats on home, mystery number hidden, profile cleanup |
+| 1.41 | 49 | Signed-in-since backfill from Cognito (condition bug — skipped existing records) |
+| 1.42 | 50 | Fixed backfill — always overwrites from Cognito `assigned_at` |
+
+### Still deferred
+
+- **Jessie migration** — rename code `1002` → `RS0001`. Role updated to RS but code and S3 data still under `1002`. 14-step plan from prior session still applies.
+- **Deploy updated `assign_tcu_code` Lambda** — has `custom:assigned_at` write added this session, not yet deployed to AWS.
+
+---
+
 ## Changelog (my edits)
 
 <!-- add entries as I ship changes -->

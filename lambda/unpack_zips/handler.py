@@ -1,18 +1,29 @@
 """S3-triggered Lambda: extract CSVs from Screenlake research zips and keep a
 per-participant summary JSON up to date.
 
-Reads only from ``academia/`` (immutable raw tree). Writes:
+Handles two ZIP source trees:
 
-* ``data/panel=/panelist=/date=YYYY-MM-DD/*.csv`` — CSV metadata per source zip.
-* ``_manifests/panel=/panelist=/_index.json`` — rolling summary per participant.
+LF (participant) ZIPs — uploaded by the Android app to:
+  academia/tenant/<tenant>/panel/<panel>/<version>/panelist/<LFcode>/<zip>
+  Outputs written to:
+    data/panel=<panel>/panelist=<LFcode>/date=YYYY-MM-DD/<kind>_<uuid>.csv
+    _manifests/panel=<panel>/panelist=<LFcode>/_index.json
 
-The Lambda does not extract JPGs. Researchers open the summary JSON to see
-participant scope, then download the specific raw zip when they want images.
+RS (researcher) ZIPs — uploaded to:
+  academia/testing/tenant/<tenant>/panel/<panel>/<version>/panelist/<RScode>/<zip>
+  Outputs written under academia/testing/ to keep researcher data fully separate:
+    academia/testing/data/panel=<panel>/panelist=<RScode>/date=YYYY-MM-DD/<kind>_<uuid>.csv
+    academia/testing/_manifests/panel=<panel>/panelist=<RScode>/_index.json
 
-Concurrency safety: the summary JSON is updated in-place. Deploy this function
-with reserved concurrency = 1 so two zips can never race the read-modify-write.
-Retries are still safe because each zip's ``zip_uuid`` is idempotency-keyed
-into ``_processed_zip_uuids``.
+Separation guarantees:
+- LF ZIPs never land under academia/testing/ — the app routes by role.
+- RS ZIPs never trigger the LF output tree.
+- The S3 event filter must cover BOTH prefixes (see event_notification.json).
+- Reserved concurrency = 1 is still required to prevent manifest race conditions.
+  With two separate manifest trees a single concurrency slot is sufficient because
+  LF and RS can never race each other's manifest.
+
+The Lambda does not extract JPGs.
 """
 from __future__ import annotations
 
@@ -32,10 +43,20 @@ from botocore.exceptions import ClientError
 
 s3 = boto3.client("s3")
 
-RAW_KEY_RE = re.compile(
+# LF participant ZIPs — academia/tenant/...
+LF_KEY_RE = re.compile(
     r"^academia/tenant/(?P<tenant>[^/]+)/panel/(?P<panel>[^/]+)/"
     r"(?P<version>[^/]+)/panelist/(?P<panelist>[^/]+)/(?P<zip_name>[^/]+\.zip)$"
 )
+
+# RS researcher ZIPs — academia/testing/tenant/...
+RS_KEY_RE = re.compile(
+    r"^academia/testing/tenant/(?P<tenant>[^/]+)/panel/(?P<panel>[^/]+)/"
+    r"(?P<version>[^/]+)/panelist/(?P<panelist>[^/]+)/(?P<zip_name>[^/]+\.zip)$"
+)
+
+# Output prefix for RS processed data — keeps it fully separate from LF data/
+RS_OUTPUT_PREFIX = "academia/testing"
 
 CSV_KINDS = {
     "screenshots":   "screenshot_data_csv_",
@@ -65,11 +86,14 @@ def lambda_handler(event, _context):
 
 
 def process_zip(bucket: str, key: str) -> None:
-    match = RAW_KEY_RE.match(key)
+    lf_match = LF_KEY_RE.match(key)
+    rs_match = RS_KEY_RE.match(key)
+    match = lf_match or rs_match
     if not match:
-        print(f"skip: key does not match raw layout: {key}")
+        print(f"skip: key does not match LF or RS raw layout: {key}")
         return
 
+    output_prefix = RS_OUTPUT_PREFIX if rs_match else ""
     panel = match["panel"]
     panelist = match["panelist"]
     zip_name = match["zip_name"]
@@ -79,7 +103,7 @@ def process_zip(bucket: str, key: str) -> None:
     s3.download_file(bucket, key, local_path)
     try:
         with zipfile.ZipFile(local_path) as zf:
-            _process_zip_open(bucket, key, zf, panel, panelist, zip_uuid)
+            _process_zip_open(bucket, key, zf, panel, panelist, zip_uuid, output_prefix)
     finally:
         try:
             os.remove(local_path)
@@ -94,6 +118,7 @@ def _process_zip_open(
     panel: str,
     panelist: str,
     zip_uuid: str,
+    output_prefix: str = "",
 ) -> None:
     members = zf.namelist()
     csvs = _index_csvs(zf, members)
@@ -130,20 +155,21 @@ def _process_zip_open(
 
     # Idempotency check — bail out before any S3 writes if this zip is already
     # accounted for in the index. Retries and manual re-invocations become no-ops.
-    index_key = f"_manifests/panel={panel}/panelist={panelist}/_index.json"
+    prefix_slash = f"{output_prefix}/" if output_prefix else ""
+    index_key = f"{prefix_slash}_manifests/panel={panel}/panelist={panelist}/_index.json"
     index = _load_index(bucket, index_key, panel, panelist)
     if zip_uuid in index["_processed_zip_uuids"]:
         print(f"skip: {zip_uuid} already in index for panelist={panelist}")
         return
 
-    # Extract CSVs to data/. Each date partition gets its own copy of every CSV
-    # so date= directories stay self-describing without cross-partition joins.
+    # Extract CSVs. LF output goes to data/; RS output goes to academia/testing/data/
+    # so researcher data is never mixed into the participant analysis tree.
     for date_partition in date_partitions:
         for kind, meta in csvs.items():
             if meta is None:
                 continue
             out_key = (
-                f"data/panel={panel}/panelist={panelist}/date={date_partition}/"
+                f"{prefix_slash}data/panel={panel}/panelist={panelist}/date={date_partition}/"
                 f"{kind}_{zip_uuid}.csv"
             )
             s3.put_object(
@@ -188,8 +214,9 @@ def _process_zip_open(
         Body=json.dumps(index, indent=2).encode("utf-8"),
         ContentType="application/json",
     )
+    role_tag = "RS" if output_prefix else "LF"
     print(
-        f"ok: src={src_key} images={len(jpg_members)} dates={sorted(date_partitions)} "
+        f"ok [{role_tag}]: src={src_key} images={len(jpg_members)} dates={sorted(date_partitions)} "
         f"total_screenshots={index['total_screenshots']} "
         f"days_participating={index['days_participating']}"
     )
