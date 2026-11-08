@@ -20,33 +20,36 @@ Merges them into a corrected state:
   user#mythubanh          — deleted (the wrong key is gone)
   code#1001               — cognito_sub corrected from "mythubanh" to UUID
 
-All three writes are executed as a single DynamoDB TransactWriteItems call with
-ConditionExpressions on every item. If any item changed between the read and
-the write, the entire transaction cancels — no partial state is ever written.
+All three writes are a single TransactWriteItems call. Every item carries a
+ConditionExpression that pins ALL backup-snapshot field values, plus checks for
+the absence of fields that should not yet exist. This catches concurrent changes
+to any field — not just the fields the migration itself modifies.
 
 Safety guarantees
 -----------------
-- Backup is written to disk BEFORE any DynamoDB writes.
-- Rollback (--rollback) restores exact original item bytes from that backup.
-- Rollback also uses ConditionExpressions to refuse if the live state has
-  changed from what migration wrote — no blind overwrites.
+- Backup is written to disk BEFORE any DynamoDB writes (atomic temp-rename).
+- Existing backup is never overwritten: if backup file already exists the script
+  verifies the live DDB state still matches that backup before proceeding.
+  If live state diverged, the script refuses and asks you to investigate.
+- Rollback verifies that EVERY field in the UUID item still matches what the
+  migration wrote. If the account was subsequently updated (e.g. assigned an RS
+  code via migrate_researcher), rollback refuses rather than overwriting.
 - Neither migration nor rollback touches S3, Cognito, or any other table.
-- Script is idempotent: re-running after a successful migration reports
-  "already migrated" without re-writing.
-- If the transaction succeeds but the script crashes before post-checks, the
-  migrated state is correct. Re-running detects this and reports success.
+- Idempotent: re-running after a successful migration reports "already complete".
+- If the transaction commits but the script crashes before post-checks, re-run
+  detects the migrated state and returns "already complete".
 
 Recovery after partial failure
 -------------------------------
-Transaction is atomic — it either fully commits or fully cancels. If the
-script crashes AFTER the transaction but before post-checks:
-  1. Re-run the script. It will detect the migrated state and report success.
-  2. If you want to revert despite a successful transaction: run --rollback.
+The transaction is atomic. It either fully commits or fully cancels; partial
+writes cannot occur. If the script crashes AFTER the transaction commits:
+  1. Re-run. Script detects migrated state → "already_complete". Done.
+  2. To revert: run --rollback.
+If it crashes BEFORE the transaction (e.g. during backup write):
+  No DDB writes occurred. Re-run safely (existing backup is preserved and
+  verified against live state before proceeding).
 
-If the script crashes BEFORE the transaction (e.g. during backup):
-  - No DynamoDB writes occurred. Re-run safely.
-
-Rollback is NOT automatic. You must explicitly pass --rollback and confirm.
+Rollback is NOT automatic. Pass --rollback explicitly.
 
 Usage
 -----
@@ -59,9 +62,6 @@ Usage
   # Revert (requires backup file from a prior run):
   python3 migrate_legacy_key.py --region us-east-2 --rollback
 
-  # Backup file location (default):
-  lambda/assign_tcu_code/backup_migrate_legacy_key.json
-
 Do not run this script without prior approval.
 """
 from __future__ import annotations
@@ -70,6 +70,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from decimal import Decimal
 from typing import Any
@@ -80,18 +81,59 @@ from botocore.exceptions import ClientError
 # ---------------------------------------------------------------------------
 # Constants — the specific accounts involved in this migration
 # ---------------------------------------------------------------------------
-TABLE_NAME = "screenlake-tcu-codes"
-LEGACY_KEY = "user#mythubanh"            # wrong key: cognito username used as sub
-UUID_SUB   = "81cb6550-3041-709d-540f-2f2237f5987c"
-UUID_KEY   = f"user#{UUID_SUB}"          # correct key: UUID sub
-CODE_KEY   = "code#1001"                 # assignment lock record for researcher code "1001"
-EMAIL      = "mythubanh@gmail.com"
-LEGACY_TCU_CODE = "1001"
-LEGACY_COGNITO_SUB = "mythubanh"         # wrong value stored in code#1001.cognito_sub
+TABLE_NAME         = "screenlake-tcu-codes"
+LEGACY_KEY         = "user#mythubanh"
+UUID_SUB           = "81cb6550-3041-709d-540f-2f2237f5987c"
+UUID_KEY           = f"user#{UUID_SUB}"
+CODE_KEY           = "code#1001"
+EMAIL              = "mythubanh@gmail.com"
+LEGACY_TCU_CODE    = "1001"
+LEGACY_COGNITO_SUB = "mythubanh"
 
 DEFAULT_BACKUP_FILE = os.path.join(
     os.path.dirname(__file__), "backup_migrate_legacy_key.json"
 )
+
+# Fields the Lambda handler may write to user# records beyond what already
+# exists in each backup item.  Absent-field guards are added to the
+# ConditionExpression so a concurrent Lambda write to any of these fields
+# cancels the transaction before our Put/Delete fires.
+UUID_STUB_GUARDED_ABSENT = [
+    "tcu_code",             # any assignment path sets this
+    "email",                # RS claim via pre-reservation sets this
+    "cognito_username",     # assignment paths set this
+    "assigned_at_epoch",    # assignment paths set this
+    "from_pre_reservation", # pre-reservation claim sets this
+    "migrated_from_key",    # our own migration audit field (not yet present)
+]
+
+LEGACY_KEY_GUARDED_ABSENT = [
+    "role",             # absent in backup; could be set by a handler update
+    "email",            # absent in backup; RS claim path sets this
+    "from_pre_reservation",
+    "migrated_to",      # hypothetical forwarding field
+    "deleted",          # retire_researcher sets this
+    "deleted_at_epoch",
+    "deleted_by",
+]
+
+CODE1001_GUARDED_ABSENT = [
+    "claimed",
+    "claimed_by_sub",
+    "claimed_at_epoch",
+    "retired",
+    "retired_at_epoch",
+    "retired_by",
+]
+
+# Fields guarded absent when verifying the UUID item during rollback.
+# If any of these appear after migration it means a legitimate write happened
+# and rollback must be refused.
+UUID_MIGRATED_GUARDED_ABSENT = [
+    "deleted",
+    "deleted_at_epoch",
+    "deleted_by",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -99,47 +141,75 @@ DEFAULT_BACKUP_FILE = os.path.join(
 # ---------------------------------------------------------------------------
 
 def _ddb_to_py(val: dict) -> Any:
-    """Convert a single DDB typed value ({"S": "x"}) to a Python value."""
-    if "S" in val:
-        return val["S"]
-    if "N" in val:
-        return Decimal(val["N"])
-    if "BOOL" in val:
-        return val["BOOL"]
-    if "NULL" in val:
-        return None
-    if "L" in val:
-        return [_ddb_to_py(v) for v in val["L"]]
-    if "M" in val:
-        return {k: _ddb_to_py(v) for k, v in val["M"].items()}
+    """Convert a single DDB typed value {"S":"x"} to a Python value."""
+    if "S"    in val: return val["S"]
+    if "N"    in val: return Decimal(val["N"])
+    if "BOOL" in val: return val["BOOL"]
+    if "NULL" in val: return None
+    if "L"    in val: return [_ddb_to_py(v) for v in val["L"]]
+    if "M"    in val: return {k: _ddb_to_py(v) for k, v in val["M"].items()}
     return val
 
 
-def _item_to_py(raw_item: dict) -> dict:
-    """Convert a full DDB low-level item ({"field": {"S": "x"}, ...}) to plain Python dict."""
-    return {k: _ddb_to_py(v) for k, v in raw_item.items()}
+def _item_to_py(raw: dict) -> dict:
+    return {k: _ddb_to_py(v) for k, v in raw.items()}
 
 
 def _py_to_ddb(val: Any) -> dict:
-    """Convert a plain Python value to a DDB typed value."""
-    if isinstance(val, bool):
-        return {"BOOL": val}
-    if isinstance(val, str):
-        return {"S": val}
-    if isinstance(val, (int, float, Decimal)):
-        return {"N": str(val)}
-    if val is None:
-        return {"NULL": True}
-    if isinstance(val, list):
-        return {"L": [_py_to_ddb(v) for v in val]}
-    if isinstance(val, dict):
-        return {"M": {k: _py_to_ddb(v) for k, v in val.items()}}
+    if isinstance(val, bool):    return {"BOOL": val}
+    if isinstance(val, str):     return {"S": val}
+    if isinstance(val, (int, float, Decimal)): return {"N": str(val)}
+    if val is None:              return {"NULL": True}
+    if isinstance(val, list):   return {"L": [_py_to_ddb(v) for v in val]}
+    if isinstance(val, dict):   return {"M": {k: _py_to_ddb(v) for k, v in val.items()}}
     return {"S": str(val)}
 
 
 def _item_to_ddb(py_item: dict) -> dict:
-    """Convert a plain Python dict to a DDB low-level item."""
     return {k: _py_to_ddb(v) for k, v in py_item.items()}
+
+
+# ---------------------------------------------------------------------------
+# Snapshot condition builder
+# ---------------------------------------------------------------------------
+
+def build_snapshot_condition(
+    item_py: dict,
+    absent_fields: list[str],
+) -> tuple[str, dict, dict]:
+    """Build a DDB ConditionExpression that pins a full item snapshot.
+
+    For every non-id field present in item_py:
+        #f_<field> = :v_<field>   (checks value matches backup)
+    For every field in absent_fields:
+        attribute_not_exists(#a_<field>)   (checks field not yet written)
+
+    Uses # aliases throughout to avoid DDB reserved-word collisions.
+
+    Returns:
+        condition_expr   — string to pass as ConditionExpression
+        names            — ExpressionAttributeNames dict
+        vals             — ExpressionAttributeValues dict (DDB wire format)
+    """
+    parts: list[str] = []
+    names: dict[str, str] = {}
+    vals:  dict[str, dict] = {}
+
+    for field in sorted(item_py):
+        if field == "id":
+            continue
+        name_alias = f"#f_{field}"
+        val_alias  = f":v_{field}"
+        names[name_alias] = field
+        vals[val_alias]   = _py_to_ddb(item_py[field])
+        parts.append(f"{name_alias} = {val_alias}")
+
+    for field in absent_fields:
+        name_alias = f"#a_{field}"
+        names[name_alias] = field
+        parts.append(f"attribute_not_exists({name_alias})")
+
+    return " AND ".join(parts), names, vals
 
 
 # ---------------------------------------------------------------------------
@@ -147,11 +217,8 @@ def _item_to_ddb(py_item: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def detect_conflicts(legacy: dict, stub: dict) -> list[str]:
-    """Return a list of field-level conflict descriptions.
-
-    A conflict is any field (other than 'id') that appears in both items with
-    different values. Fields that exist in only one item are always safe to
-    merge — they are not conflicts.
+    """Return descriptions of fields that appear in both items with different values.
+    id is never a conflict — it always differs by design.
     """
     conflicts = []
     for field, legacy_val in legacy.items():
@@ -159,44 +226,46 @@ def detect_conflicts(legacy: dict, stub: dict) -> list[str]:
             continue
         if field in stub and stub[field] != legacy_val:
             conflicts.append(
-                f"  CONFLICT field='{field}': "
+                f"  CONFLICT field={field!r}: "
                 f"legacy={legacy_val!r}, stub={stub[field]!r}"
             )
     return conflicts
 
 
 def build_merged_item(legacy: dict, stub: dict, epoch: int) -> dict:
-    """Build the merged UUID-keyed user record.
+    """Merge legacy and stub records into the correct UUID-keyed record.
 
-    Merge rules:
-    - Start with all fields from the legacy record (the authoritative source
-      for tcu_code, cognito_username, assigned_at_epoch).
-    - Add any fields from the stub that are absent from the legacy record
-      (preserves role="TEST" from the stub).
-    - Override id to the correct UUID key.
-    - Set cognito_sub to the UUID (this field was absent from the legacy record).
-    - Add migration audit fields (migrated_from_key, migrated_at_epoch).
+    Rules:
+      - All fields from legacy are preserved.
+      - Stub-only fields (not in legacy) are added.
+      - id is replaced with the UUID key.
+      - cognito_sub is set to the UUID.
+      - Migration audit fields are appended.
 
-    Caller must check detect_conflicts() first; this function does not raise on
-    conflicts — it always uses the legacy value as the winner for any overlap.
+    Call detect_conflicts() first; this function uses the legacy value as the
+    winner for any overlap without raising.
     """
     merged = dict(legacy)
-
-    # Add fields from stub that are missing from legacy
     for field, value in stub.items():
         if field == "id":
             continue
         if field not in merged:
             merged[field] = value
-
-    # Override/set the correct id and sub
-    merged["id"] = UUID_KEY
-    merged["cognito_sub"] = UUID_SUB
-
-    # Migration audit trail
+    merged["id"]                = UUID_KEY
+    merged["cognito_sub"]       = UUID_SUB
     merged["migrated_from_key"] = LEGACY_KEY
     merged["migrated_at_epoch"] = epoch
+    return merged
 
+
+def build_expected_migrated_item(legacy_py: dict, stub_py: dict) -> dict:
+    """Reconstruct the expected UUID item state after a successful migration.
+
+    Excludes migrated_at_epoch (timestamp varies by run; cannot be verified
+    deterministically in a rollback ConditionExpression).
+    """
+    merged = build_merged_item(legacy_py, stub_py, epoch=0)
+    merged.pop("migrated_at_epoch", None)
     return merged
 
 
@@ -205,64 +274,110 @@ def build_merged_item(legacy: dict, stub: dict, epoch: int) -> dict:
 # ---------------------------------------------------------------------------
 
 class MigrationState:
-    NOT_STARTED = "not_started"
-    COMPLETE    = "complete"
+    NOT_STARTED  = "not_started"
+    COMPLETE     = "complete"
     INCONSISTENT = "inconsistent"
 
 
 def detect_state(
-    legacy_item: dict | None,
-    uuid_item:   dict | None,
-    code_item:   dict | None,
+    legacy_py: dict | None,
+    uuid_py:   dict | None,
+    code_py:   dict | None,
 ) -> tuple[str, str]:
-    """Classify the current DynamoDB state.
-
-    Returns (MigrationState, description).
-
-    not_started:  legacy key exists as expected, UUID item is the TEST stub,
-                  code#1001.cognito_sub is still "mythubanh"
-    complete:     legacy key is gone, UUID item has tcu_code="1001" and
-                  migrated_from_key set, code#1001.cognito_sub is UUID
-    inconsistent: any other combination — requires manual review
-    """
-    legacy_exists = legacy_item is not None
-    uuid_has_code = uuid_item is not None and uuid_item.get("tcu_code") == LEGACY_TCU_CODE
-    uuid_migrated = uuid_item is not None and "migrated_from_key" in uuid_item
-    code_has_uuid = (
-        code_item is not None and
-        code_item.get("cognito_sub") == UUID_SUB
-    )
-    code_has_legacy = (
-        code_item is not None and
-        code_item.get("cognito_sub") == LEGACY_COGNITO_SUB
-    )
+    """Classify current DDB state. Returns (MigrationState constant, description)."""
+    legacy_exists = legacy_py is not None
+    uuid_has_code = uuid_py is not None and uuid_py.get("tcu_code") == LEGACY_TCU_CODE
+    uuid_migrated = uuid_py is not None and "migrated_from_key" in uuid_py
+    code_has_uuid   = code_py is not None and code_py.get("cognito_sub") == UUID_SUB
+    code_has_legacy = code_py is not None and code_py.get("cognito_sub") == LEGACY_COGNITO_SUB
 
     if legacy_exists and not uuid_has_code and code_has_legacy:
-        # Normal pre-migration state
         return MigrationState.NOT_STARTED, "Migration not yet run."
 
     if not legacy_exists and uuid_has_code and uuid_migrated and code_has_uuid:
-        # Normal post-migration state
         return MigrationState.COMPLETE, "Migration already complete (idempotent)."
 
-    desc_parts = []
-    if legacy_exists:
-        desc_parts.append(f"legacy key {LEGACY_KEY!r} still exists")
-    else:
-        desc_parts.append(f"legacy key {LEGACY_KEY!r} is gone")
-    if uuid_item is not None:
-        desc_parts.append(
-            f"UUID item tcu_code={uuid_item.get('tcu_code')!r} "
-            f"migrated_from_key={'present' if 'migrated_from_key' in uuid_item else 'absent'}"
+    parts = []
+    parts.append(f"{LEGACY_KEY!r} {'exists' if legacy_exists else 'absent'}")
+    if uuid_py is not None:
+        parts.append(
+            f"UUID item tcu_code={uuid_py.get('tcu_code')!r} "
+            f"migrated_from_key={'present' if 'migrated_from_key' in uuid_py else 'absent'}"
         )
     else:
-        desc_parts.append("UUID item is absent")
-    if code_item is not None:
-        desc_parts.append(f"code#1001.cognito_sub={code_item.get('cognito_sub')!r}")
+        parts.append("UUID item absent")
+    if code_py is not None:
+        parts.append(f"code#1001.cognito_sub={code_py.get('cognito_sub')!r}")
     else:
-        desc_parts.append("code#1001 is absent")
+        parts.append("code#1001 absent")
 
-    return MigrationState.INCONSISTENT, "Inconsistent state: " + "; ".join(desc_parts)
+    return MigrationState.INCONSISTENT, "Inconsistent: " + "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Backup helpers
+# ---------------------------------------------------------------------------
+
+def _write_backup_atomic(backup: dict, path: str) -> None:
+    """Write backup JSON atomically via a temp file and os.rename.
+
+    os.rename is atomic on POSIX when src and dst are on the same filesystem.
+    The temp file is created in the same directory to ensure this.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(backup, f, indent=2, default=str)
+        os.rename(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _verify_backup_matches_live(
+    backup: dict,
+    live_legacy: dict | None,
+    live_uuid:   dict | None,
+    live_code:   dict | None,
+) -> list[str]:
+    """Compare live DDB items against a loaded backup.
+
+    Returns a list of discrepancy strings (empty → all match).
+    Items in both backup and live are compared field-by-field (Python values).
+    """
+    discrepancies: list[str] = []
+    items_to_check = {
+        LEGACY_KEY: live_legacy,
+        UUID_KEY:   live_uuid,
+        CODE_KEY:   live_code,
+    }
+    for key, live_raw in items_to_check.items():
+        backup_raw = backup.get("items", {}).get(key)
+        # Presence/absence mismatch
+        if backup_raw is None and live_raw is not None:
+            discrepancies.append(f"{key}: absent in backup, present live")
+            continue
+        if backup_raw is not None and live_raw is None:
+            discrepancies.append(f"{key}: present in backup, absent live")
+            continue
+        if backup_raw is None and live_raw is None:
+            continue
+        # Both present — compare field-by-field
+        backup_py = _item_to_py(backup_raw)
+        live_py   = _item_to_py(live_raw)
+        all_fields = set(backup_py) | set(live_py)
+        for field in sorted(all_fields):
+            bv = backup_py.get(field)
+            lv = live_py.get(field)
+            if bv != lv:
+                discrepancies.append(
+                    f"{key}.{field}: backup={bv!r}, live={lv!r}"
+                )
+    return discrepancies
 
 
 # ---------------------------------------------------------------------------
@@ -270,16 +385,16 @@ def detect_state(
 # ---------------------------------------------------------------------------
 
 def run_migration(
-    ddb: Any,       # boto3 low-level DynamoDB client
+    ddb: Any,
     table_name: str,
     backup_path: str,
     dry_run: bool = False,
 ) -> dict:
-    """Execute the migration. Returns a result dict.
+    """Execute the migration. Returns a result dict with 'status' key.
 
     Separated from main() so tests can inject mock clients directly.
     """
-    print(f"Reading current DynamoDB state from table '{table_name}'...")
+    print(f"Reading current DynamoDB state from '{table_name}'...")
 
     legacy_raw = ddb.get_item(TableName=table_name, Key={"id": {"S": LEGACY_KEY}}).get("Item")
     uuid_raw   = ddb.get_item(TableName=table_name, Key={"id": {"S": UUID_KEY}}).get("Item")
@@ -294,7 +409,6 @@ def run_migration(
     print(f"  {UUID_KEY}:   {json.dumps(uuid_py, default=str) if uuid_py else 'NOT FOUND'}")
     print(f"  {CODE_KEY}:   {json.dumps(code_py, default=str) if code_py else 'NOT FOUND'}")
 
-    # --- State classification ---
     state, state_desc = detect_state(legacy_py, uuid_py, code_py)
     print(f"\nMigration state: {state} — {state_desc}")
 
@@ -303,90 +417,85 @@ def run_migration(
         return {"status": "already_complete", "idempotent": True}
 
     if state == MigrationState.INCONSISTENT:
-        print(f"\nERROR: {state_desc}")
-        print("Cannot safely proceed. Investigate manually before running migration.")
         return {"status": "error", "reason": state_desc}
 
-    # --- Pre-condition checks ---
-    assert legacy_py is not None, "legacy item should exist in NOT_STARTED state"
-    assert uuid_py   is not None, "UUID stub should exist in NOT_STARTED state"
-    assert code_py   is not None, "code#1001 should exist in NOT_STARTED state"
+    # --- Structural pre-conditions ---
+    assert legacy_py is not None and uuid_py is not None and code_py is not None
 
     if legacy_py.get("tcu_code") != LEGACY_TCU_CODE:
-        return {
-            "status": "error",
-            "reason": (
-                f"Expected {LEGACY_KEY}.tcu_code={LEGACY_TCU_CODE!r}, "
-                f"got {legacy_py.get('tcu_code')!r}. Investigate."
-            ),
-        }
-
+        return {"status": "error", "reason": (
+            f"Expected {LEGACY_KEY}.tcu_code={LEGACY_TCU_CODE!r}, "
+            f"got {legacy_py.get('tcu_code')!r}. Investigate."
+        )}
     if uuid_py.get("tcu_code") is not None:
-        return {
-            "status": "error",
-            "reason": (
-                f"{UUID_KEY} already has tcu_code={uuid_py['tcu_code']!r}. "
-                "UUID stub may have been assigned a code by another path. Investigate."
-            ),
-        }
-
+        return {"status": "error", "reason": (
+            f"{UUID_KEY} already has tcu_code={uuid_py['tcu_code']!r}. "
+            "UUID stub may have been assigned a code by another path. Investigate."
+        )}
     if code_py.get("cognito_sub") != LEGACY_COGNITO_SUB:
-        return {
-            "status": "error",
-            "reason": (
-                f"Expected {CODE_KEY}.cognito_sub={LEGACY_COGNITO_SUB!r}, "
-                f"got {code_py.get('cognito_sub')!r}. Investigate."
-            ),
-        }
+        return {"status": "error", "reason": (
+            f"Expected {CODE_KEY}.cognito_sub={LEGACY_COGNITO_SUB!r}, "
+            f"got {code_py.get('cognito_sub')!r}. Investigate."
+        )}
 
     # --- Conflict analysis ---
     print(f"\n--- Field analysis ---")
-    print(f"  Legacy record fields:  {sorted(legacy_py.keys())}")
-    print(f"  UUID stub fields:      {sorted(uuid_py.keys())}")
-
-    legacy_only = set(legacy_py) - set(uuid_py) - {"id"}
-    stub_only   = set(uuid_py)   - set(legacy_py) - {"id"}
-    shared      = (set(legacy_py) & set(uuid_py)) - {"id"}
-
-    if legacy_only:
-        print(f"  Fields in legacy only (will be preserved):  {sorted(legacy_only)}")
-    if stub_only:
-        print(f"  Fields in stub only (will be preserved):    {sorted(stub_only)}")
-    if shared:
-        print(f"  Fields in both (checking for conflicts):    {sorted(shared)}")
+    print(f"  Legacy fields: {sorted(legacy_py)}")
+    print(f"  Stub fields:   {sorted(uuid_py)}")
+    legacy_only = sorted(set(legacy_py) - set(uuid_py) - {"id"})
+    stub_only   = sorted(set(uuid_py)   - set(legacy_py) - {"id"})
+    shared      = sorted((set(legacy_py) & set(uuid_py)) - {"id"})
+    if legacy_only: print(f"  Legacy-only fields (preserved): {legacy_only}")
+    if stub_only:   print(f"  Stub-only fields (preserved):   {stub_only}")
+    if shared:      print(f"  Shared fields (conflict-check): {shared}")
 
     conflicts = detect_conflicts(legacy_py, uuid_py)
     if conflicts:
-        print(f"\n  CONFLICTS detected — cannot proceed:")
         for c in conflicts:
             print(c)
-        return {
-            "status": "error",
-            "reason": f"{len(conflicts)} field conflict(s) require manual resolution",
-            "conflicts": conflicts,
-        }
-    print(f"  No field conflicts. Safe to merge.")
+        return {"status": "error", "reason": f"{len(conflicts)} conflict(s) require manual resolution", "conflicts": conflicts}
+    print("  No conflicts.")
 
-    # --- Build merged item ---
+    # --- Build merged item and transaction conditions ---
     epoch = int(time.time())
-    merged_py = build_merged_item(legacy_py, uuid_py, epoch)
+    merged_py  = build_merged_item(legacy_py, uuid_py, epoch)
     merged_raw = _item_to_ddb(merged_py)
 
+    # Condition for UUID stub Put: ALL backup fields must still match +
+    # guarded-absent fields must still be absent.
+    uuid_cond, uuid_names, uuid_vals = build_snapshot_condition(
+        uuid_py, UUID_STUB_GUARDED_ABSENT
+    )
+
+    # Condition for legacy key Delete: ALL backup fields match + guarded-absent.
+    legacy_cond, legacy_names, legacy_vals = build_snapshot_condition(
+        legacy_py, LEGACY_KEY_GUARDED_ABSENT
+    )
+
+    # Condition for code#1001 Update: ALL backup fields match + guarded-absent.
+    code_cond, code_names, code_vals = build_snapshot_condition(
+        code_py, CODE1001_GUARDED_ABSENT
+    )
+    # Update expression needs its own alias for the field being changed.
+    code_upd_names = {"#u_cognito_sub": "cognito_sub"}
+    code_upd_vals  = {":u_cognito_sub": {"S": UUID_SUB}}
+
     print(f"\n--- Migration plan ---")
-    print(f"  PUT   {UUID_KEY}:  (merged, {len(merged_py)} fields)")
-    print(f"        Fields: {sorted(merged_py.keys())}")
+    print(f"  PUT    {UUID_KEY}  ({len(merged_py)} fields)")
+    print(f"         Snapshot condition pins {len(uuid_py) - 1} field(s) + "
+          f"{len(UUID_STUB_GUARDED_ABSENT)} absent-field guard(s)")
     print(f"  DELETE {LEGACY_KEY}")
-    print(f"  UPDATE {CODE_KEY}:  cognito_sub: {LEGACY_COGNITO_SUB!r} → {UUID_SUB!r}")
-    print(f"\n  Transaction conditions:")
-    print(f"    {UUID_KEY}:   attribute_not_exists(tcu_code) AND #role = 'TEST'")
-    print(f"    {LEGACY_KEY}: tcu_code = {LEGACY_TCU_CODE!r} AND attribute_not_exists(migrated_to)")
-    print(f"    {CODE_KEY}:   cognito_sub = {LEGACY_COGNITO_SUB!r}")
+    print(f"         Snapshot condition pins {len(legacy_py) - 1} field(s) + "
+          f"{len(LEGACY_KEY_GUARDED_ABSENT)} absent-field guard(s)")
+    print(f"  UPDATE {CODE_KEY}  SET cognito_sub → {UUID_SUB!r}")
+    print(f"         Snapshot condition pins {len(code_py) - 1} field(s) + "
+          f"{len(CODE1001_GUARDED_ABSENT)} absent-field guard(s)")
 
     if dry_run:
         print(f"\n[dry-run] No DynamoDB writes performed.")
         return {"status": "dry_run", "merged_item": merged_py}
 
-    # --- Save backup before any writes ---
+    # --- Backup before any writes ---
     backup = {
         "backup_created_at_epoch": epoch,
         "items": {
@@ -395,58 +504,59 @@ def run_migration(
             CODE_KEY:   code_raw,
         },
     }
-    print(f"\nWriting backup to {backup_path} ...")
-    with open(backup_path, "w") as f:
-        json.dump(backup, f, indent=2, default=str)
-    print(f"Backup written.")
+
+    if os.path.exists(backup_path):
+        print(f"\nBackup file already exists at {backup_path}.")
+        print("Verifying live state matches that backup before reusing it...")
+        with open(backup_path) as f:
+            existing_backup = json.load(f)
+        discrepancies = _verify_backup_matches_live(
+            existing_backup, legacy_raw, uuid_raw, code_raw
+        )
+        if discrepancies:
+            msg = (
+                f"Live DDB state differs from existing backup:\n" +
+                "\n".join(f"  {d}" for d in discrepancies) +
+                f"\nBackup file: {backup_path}\n"
+                "Investigate before proceeding. Do not delete the backup without understanding why."
+            )
+            return {"status": "error", "reason": msg}
+        print("  Live state matches backup. Reusing existing backup.")
+    else:
+        print(f"\nWriting backup to {backup_path} ...")
+        _write_backup_atomic(backup, backup_path)
+        print("Backup written.")
 
     # --- Execute transaction ---
     print(f"\nExecuting DynamoDB transaction...")
     try:
         ddb.transact_write_items(TransactItems=[
-            # Item 0: Put merged record into UUID key
-            # Condition: UUID stub must still have no tcu_code (not assigned by another path)
-            # AND role must still be "TEST" (stub unchanged since our read)
             {
                 "Put": {
                     "TableName": table_name,
                     "Item": merged_raw,
-                    "ExpressionAttributeNames": {"#role": "role"},
-                    "ExpressionAttributeValues": {
-                        ":stub_role": {"S": "TEST"},
-                    },
-                    "ConditionExpression": (
-                        "attribute_not_exists(tcu_code) AND #role = :stub_role"
-                    ),
+                    "ConditionExpression": uuid_cond,
+                    "ExpressionAttributeNames":  uuid_names,
+                    "ExpressionAttributeValues": uuid_vals,
                 }
             },
-            # Item 1: Delete legacy key
-            # Condition: tcu_code must be unchanged and not already migrated
             {
                 "Delete": {
                     "TableName": table_name,
                     "Key": {"id": {"S": LEGACY_KEY}},
-                    "ExpressionAttributeValues": {
-                        ":expected_tcu_code": {"S": LEGACY_TCU_CODE},
-                    },
-                    "ConditionExpression": (
-                        "tcu_code = :expected_tcu_code AND "
-                        "attribute_not_exists(migrated_to)"
-                    ),
+                    "ConditionExpression": legacy_cond,
+                    "ExpressionAttributeNames":  legacy_names,
+                    "ExpressionAttributeValues": legacy_vals,
                 }
             },
-            # Item 2: Update code#1001.cognito_sub to UUID
-            # Condition: cognito_sub must still be the legacy username
             {
                 "Update": {
                     "TableName": table_name,
                     "Key": {"id": {"S": CODE_KEY}},
-                    "UpdateExpression": "SET cognito_sub = :uuid_sub",
-                    "ExpressionAttributeValues": {
-                        ":uuid_sub":    {"S": UUID_SUB},
-                        ":legacy_sub":  {"S": LEGACY_COGNITO_SUB},
-                    },
-                    "ConditionExpression": "cognito_sub = :legacy_sub",
+                    "UpdateExpression": "SET #u_cognito_sub = :u_cognito_sub",
+                    "ConditionExpression": code_cond,
+                    "ExpressionAttributeNames":  {**code_names, **code_upd_names},
+                    "ExpressionAttributeValues": {**code_vals, **code_upd_vals},
                 }
             },
         ])
@@ -455,22 +565,25 @@ def run_migration(
         if err_code == "TransactionCanceledException":
             reasons = e.response.get("CancellationReasons", [])
             item_labels = [
-                f"{UUID_KEY} (tcu_code appeared or role changed since backup)",
-                f"{LEGACY_KEY} (tcu_code changed or migrated_to appeared since backup)",
-                f"{CODE_KEY} (cognito_sub changed since backup)",
+                f"{UUID_KEY} (a field changed or unexpected field appeared since backup)",
+                f"{LEGACY_KEY} (a field changed or unexpected field appeared since backup)",
+                f"{CODE_KEY} (a field changed or unexpected field appeared since backup)",
             ]
             failed = [
                 item_labels[i]
                 for i, r in enumerate(reasons)
                 if r.get("Code") == "ConditionalCheckFailed"
             ]
-            msg = (
-                "Transaction cancelled — concurrent modification detected:\n  " +
-                "\n  ".join(failed) +
-                "\nBackup preserved at: " + backup_path +
-                "\nRe-read state and verify before retrying."
-            )
-            return {"status": "cancelled", "reason": msg, "failed_items": failed}
+            return {
+                "status": "cancelled",
+                "reason": (
+                    "Transaction cancelled — concurrent modification detected:\n  " +
+                    "\n  ".join(failed) +
+                    f"\nBackup preserved at: {backup_path}\n"
+                    "Re-read the live state and verify before retrying."
+                ),
+                "failed_items": failed,
+            }
         return {"status": "error", "reason": f"Unexpected DynamoDB error: {e}"}
 
     print("Transaction committed.")
@@ -479,54 +592,30 @@ def run_migration(
     print("\nVerifying post-migration state...")
     errors = []
 
-    legacy_after = ddb.get_item(
-        TableName=table_name, Key={"id": {"S": LEGACY_KEY}}
-    ).get("Item")
-    if legacy_after is not None:
-        errors.append(f"FAIL: {LEGACY_KEY} still exists after migration")
+    if ddb.get_item(TableName=table_name, Key={"id": {"S": LEGACY_KEY}}).get("Item"):
+        errors.append(f"FAIL: {LEGACY_KEY} still exists")
     else:
         print(f"  OK: {LEGACY_KEY} deleted")
 
-    uuid_after_raw = ddb.get_item(
-        TableName=table_name, Key={"id": {"S": UUID_KEY}}
-    ).get("Item")
-    if uuid_after_raw is None:
-        errors.append(f"FAIL: {UUID_KEY} not found after migration")
+    uuid_after = _item_to_py(ddb.get_item(TableName=table_name, Key={"id": {"S": UUID_KEY}}).get("Item") or {})
+    if not uuid_after:
+        errors.append(f"FAIL: {UUID_KEY} not found")
+    elif uuid_after.get("tcu_code") != LEGACY_TCU_CODE:
+        errors.append(f"FAIL: {UUID_KEY}.tcu_code={uuid_after.get('tcu_code')!r}")
+    elif uuid_after.get("cognito_sub") != UUID_SUB:
+        errors.append(f"FAIL: {UUID_KEY}.cognito_sub={uuid_after.get('cognito_sub')!r}")
+    elif "migrated_from_key" not in uuid_after:
+        errors.append(f"FAIL: {UUID_KEY} missing migrated_from_key")
     else:
-        uuid_after = _item_to_py(uuid_after_raw)
-        if uuid_after.get("tcu_code") != LEGACY_TCU_CODE:
-            errors.append(
-                f"FAIL: {UUID_KEY}.tcu_code = {uuid_after.get('tcu_code')!r}, "
-                f"expected {LEGACY_TCU_CODE!r}"
-            )
-        elif uuid_after.get("cognito_sub") != UUID_SUB:
-            errors.append(
-                f"FAIL: {UUID_KEY}.cognito_sub = {uuid_after.get('cognito_sub')!r}, "
-                f"expected {UUID_SUB!r}"
-            )
-        elif "migrated_from_key" not in uuid_after:
-            errors.append(f"FAIL: {UUID_KEY} missing migrated_from_key")
-        else:
-            print(
-                f"  OK: {UUID_KEY} has tcu_code={uuid_after['tcu_code']!r}, "
-                f"cognito_sub={uuid_after['cognito_sub']!r}, "
-                f"migrated_from_key={uuid_after['migrated_from_key']!r}"
-            )
+        print(f"  OK: {UUID_KEY} has tcu_code, cognito_sub, migrated_from_key")
 
-    code_after_raw = ddb.get_item(
-        TableName=table_name, Key={"id": {"S": CODE_KEY}}
-    ).get("Item")
-    if code_after_raw is None:
-        errors.append(f"FAIL: {CODE_KEY} not found after migration")
+    code_after = _item_to_py(ddb.get_item(TableName=table_name, Key={"id": {"S": CODE_KEY}}).get("Item") or {})
+    if not code_after:
+        errors.append(f"FAIL: {CODE_KEY} not found")
+    elif code_after.get("cognito_sub") != UUID_SUB:
+        errors.append(f"FAIL: {CODE_KEY}.cognito_sub={code_after.get('cognito_sub')!r}")
     else:
-        code_after = _item_to_py(code_after_raw)
-        if code_after.get("cognito_sub") != UUID_SUB:
-            errors.append(
-                f"FAIL: {CODE_KEY}.cognito_sub = {code_after.get('cognito_sub')!r}, "
-                f"expected {UUID_SUB!r}"
-            )
-        else:
-            print(f"  OK: {CODE_KEY}.cognito_sub corrected to UUID")
+        print(f"  OK: {CODE_KEY}.cognito_sub corrected to UUID")
 
     if errors:
         for e in errors:
@@ -536,19 +625,16 @@ def run_migration(
             "errors": errors,
             "note": (
                 "Transaction committed but post-checks failed. "
-                "Re-run to re-verify (may be a transient read issue). "
+                "Re-run to re-verify (may be transient). "
                 "Use --rollback to revert if needed."
             ),
         }
 
-    print("\nMigration complete. All post-checks passed.")
+    print(f"\nMigration complete. All post-checks passed.")
     print(f"Backup retained at: {backup_path}")
     print(f"\nTo rollback if needed:")
     print(f"  python3 migrate_legacy_key.py --region us-east-2 --rollback")
-    return {
-        "status": "complete",
-        "merged_item": merged_py,
-    }
+    return {"status": "complete", "merged_item": merged_py}
 
 
 # ---------------------------------------------------------------------------
@@ -562,26 +648,18 @@ def run_rollback(
 ) -> dict:
     """Restore exact original DynamoDB state from backup.
 
-    Safety conditions (checked before writing):
-      - user#UUID must have tcu_code="1001" and migrated_from_key set
-        (proves it was written by our migration, not something else)
-      - user#mythubanh must not exist
-        (migration deleted it; if it's back, something else already restored it)
-      - code#1001.cognito_sub must equal the UUID sub
-        (migration changed it; if it's already "mythubanh", something else reverted it)
-
-    All three items are written in a single TransactWriteItems call.
-    If any condition fails, nothing is written.
+    Rollback conditions verify that the live state still matches what the
+    migration wrote — not just the migration-provenance fields (tcu_code,
+    migrated_from_key) but ALL fields that migration touched. If any field
+    was subsequently modified by a legitimate write (e.g. migrate_researcher
+    updated tcu_code to RS0006, retire_researcher added deleted=True), the
+    corresponding condition fails and rollback is refused atomically.
     """
     if not os.path.exists(backup_path):
-        return {
-            "status": "error",
-            "reason": (
-                f"Backup file not found: {backup_path}\n"
-                "Cannot rollback without a backup. "
-                "If migration was not run from this machine, locate the backup manually."
-            ),
-        }
+        return {"status": "error", "reason": (
+            f"Backup file not found: {backup_path}\n"
+            "Cannot rollback without a backup."
+        )}
 
     print(f"Loading backup from {backup_path} ...")
     with open(backup_path) as f:
@@ -593,83 +671,79 @@ def run_rollback(
     code_backup_raw   = backup_items.get(CODE_KEY)
 
     if not legacy_backup_raw or not uuid_backup_raw or not code_backup_raw:
-        return {
-            "status": "error",
-            "reason": "Backup file is incomplete — one or more items are missing.",
-        }
+        return {"status": "error", "reason": "Backup file is incomplete — one or more items missing."}
+
+    legacy_backup_py = _item_to_py(legacy_backup_raw)
+    uuid_backup_py   = _item_to_py(uuid_backup_raw)
+    code_backup_py   = _item_to_py(code_backup_raw)
 
     print(f"Backup created at epoch: {backup.get('backup_created_at_epoch')}")
-    print(f"Restoring:")
-    print(f"  {LEGACY_KEY}: {json.dumps(_item_to_py(legacy_backup_raw), default=str)}")
-    print(f"  {UUID_KEY}:   (restore to original stub)")
+    print(f"Will restore:")
+    print(f"  {LEGACY_KEY}: {json.dumps(legacy_backup_py, default=str)}")
+    print(f"  {UUID_KEY}:   (restore to original stub {json.dumps(uuid_backup_py, default=str)})")
     print(f"  {CODE_KEY}:   cognito_sub → {LEGACY_COGNITO_SUB!r}")
 
-    # Read live state before writing
+    # --- Read live state ---
     print(f"\nReading current live state...")
     uuid_live_raw   = ddb.get_item(TableName=table_name, Key={"id": {"S": UUID_KEY}}).get("Item")
     legacy_live_raw = ddb.get_item(TableName=table_name, Key={"id": {"S": LEGACY_KEY}}).get("Item")
     code_live_raw   = ddb.get_item(TableName=table_name, Key={"id": {"S": CODE_KEY}}).get("Item")
 
-    uuid_live   = _item_to_py(uuid_live_raw)   if uuid_live_raw   else None
-    legacy_live = _item_to_py(legacy_live_raw) if legacy_live_raw else None
-    code_live   = _item_to_py(code_live_raw)   if code_live_raw   else None
-
+    uuid_live = _item_to_py(uuid_live_raw) if uuid_live_raw else None
     print(f"  {UUID_KEY}:   {json.dumps(uuid_live, default=str) if uuid_live else 'NOT FOUND'}")
-    print(f"  {LEGACY_KEY}: {json.dumps(legacy_live, default=str) if legacy_live else 'NOT FOUND'}")
-    print(f"  {CODE_KEY}:   {json.dumps(code_live, default=str) if code_live else 'NOT FOUND'}")
+    print(f"  {LEGACY_KEY}: {'present' if legacy_live_raw else 'NOT FOUND'}")
+    print(f"  {CODE_KEY}:   {json.dumps(_item_to_py(code_live_raw), default=str) if code_live_raw else 'NOT FOUND'}")
 
-    # Pre-rollback safety checks (informational — ConditionExpressions are the real guard)
-    if legacy_live is not None:
-        print(f"\nWARNING: {LEGACY_KEY} already exists — migration may have been partially or fully reverted already.")
     if uuid_live is None:
-        return {
-            "status": "error",
-            "reason": f"{UUID_KEY} not found. Cannot rollback — UUID item is missing.",
-        }
+        return {"status": "error", "reason": f"{UUID_KEY} not found. Cannot rollback."}
     if uuid_live.get("tcu_code") != LEGACY_TCU_CODE:
-        return {
-            "status": "error",
-            "reason": (
-                f"{UUID_KEY}.tcu_code = {uuid_live.get('tcu_code')!r}, "
-                f"expected {LEGACY_TCU_CODE!r}. "
-                "UUID item does not match what migration wrote. Investigate."
-            ),
-        }
+        return {"status": "error", "reason": (
+            f"{UUID_KEY}.tcu_code={uuid_live.get('tcu_code')!r}, "
+            f"expected {LEGACY_TCU_CODE!r}. Item may have been updated since migration. Investigate."
+        )}
     if "migrated_from_key" not in uuid_live:
-        return {
-            "status": "error",
-            "reason": (
-                f"{UUID_KEY} is missing migrated_from_key. "
-                "Cannot confirm this was written by the migration. Investigate."
-            ),
-        }
+        return {"status": "error", "reason": (
+            f"{UUID_KEY} is missing migrated_from_key. "
+            "Cannot confirm this was written by the migration."
+        )}
 
-    # Build the restore transaction
-    # uuid_backup_raw is the original stub: {"id": {"S": UUID_KEY}, "role": {"S": "TEST"}}
-    # We Put this exact item back (replacing all fields — removes the migration fields).
+    # --- Build conditions for rollback transaction ---
+
+    # Rollback UUID item condition: pin ALL fields that migration wrote
+    # (excluding migrated_at_epoch which varies and cannot be reproduced exactly).
+    # + absent-field guards for fields that would indicate a legitimate post-migration write.
+    expected_migrated = build_expected_migrated_item(legacy_backup_py, uuid_backup_py)
+    rbk_uuid_cond, rbk_uuid_names, rbk_uuid_vals = build_snapshot_condition(
+        expected_migrated, UUID_MIGRATED_GUARDED_ABSENT
+    )
+
+    # Rollback legacy item condition: must still not exist (migration deleted it).
+    # (Simple condition; ConditionExpression on the Put operation handles this.)
+
+    # Rollback code#1001 condition: pin ALL fields of the post-migration state
+    # (backup fields + corrected cognito_sub) + guarded-absent for claimed/retired.
+    expected_code_migrated = {**code_backup_py, "cognito_sub": UUID_SUB}
+    rbk_code_cond, rbk_code_names, rbk_code_vals = build_snapshot_condition(
+        expected_code_migrated, CODE1001_GUARDED_ABSENT
+    )
+    rbk_code_upd_names = {"#r_cognito_sub": "cognito_sub"}
+    rbk_code_upd_vals  = {":r_cognito_sub": {"S": LEGACY_COGNITO_SUB}}
 
     print(f"\nExecuting rollback transaction...")
     try:
         ddb.transact_write_items(TransactItems=[
-            # Item 0: Restore UUID item to original stub
-            # Condition: must have tcu_code="1001" (our migration wrote it) and
-            # migrated_from_key present (confirms migration provenance)
+            # Restore UUID item to original stub content.
+            # Condition pins all migration-written fields + guards absent fields.
             {
                 "Put": {
                     "TableName": table_name,
                     "Item": uuid_backup_raw,
-                    "ExpressionAttributeValues": {
-                        ":expected_tcu_code":     {"S": LEGACY_TCU_CODE},
-                        ":expected_migrated_from": {"S": LEGACY_KEY},
-                    },
-                    "ConditionExpression": (
-                        "tcu_code = :expected_tcu_code AND "
-                        "migrated_from_key = :expected_migrated_from"
-                    ),
+                    "ConditionExpression": rbk_uuid_cond,
+                    "ExpressionAttributeNames":  rbk_uuid_names,
+                    "ExpressionAttributeValues": rbk_uuid_vals,
                 }
             },
-            # Item 1: Restore legacy key
-            # Condition: must not exist (migration deleted it)
+            # Restore legacy key — must not exist (migration deleted it).
             {
                 "Put": {
                     "TableName": table_name,
@@ -677,18 +751,16 @@ def run_rollback(
                     "ConditionExpression": "attribute_not_exists(id)",
                 }
             },
-            # Item 2: Restore code#1001.cognito_sub to legacy username
-            # Condition: must currently be the UUID (migration changed it)
+            # Restore code#1001.cognito_sub.
+            # Condition pins all post-migration fields + guards claimed/retired.
             {
                 "Update": {
                     "TableName": table_name,
                     "Key": {"id": {"S": CODE_KEY}},
-                    "UpdateExpression": "SET cognito_sub = :legacy_sub",
-                    "ExpressionAttributeValues": {
-                        ":legacy_sub": {"S": LEGACY_COGNITO_SUB},
-                        ":uuid_sub":   {"S": UUID_SUB},
-                    },
-                    "ConditionExpression": "cognito_sub = :uuid_sub",
+                    "UpdateExpression": "SET #r_cognito_sub = :r_cognito_sub",
+                    "ConditionExpression": rbk_code_cond,
+                    "ExpressionAttributeNames":  {**rbk_code_names, **rbk_code_upd_names},
+                    "ExpressionAttributeValues": {**rbk_code_vals, **rbk_code_upd_vals},
                 }
             },
         ])
@@ -697,85 +769,64 @@ def run_rollback(
         if err_code == "TransactionCanceledException":
             reasons = e.response.get("CancellationReasons", [])
             item_labels = [
-                f"{UUID_KEY} (tcu_code or migrated_from_key changed — not our migration's item)",
-                f"{LEGACY_KEY} (already exists — another process restored it)",
-                f"{CODE_KEY} (cognito_sub is not {UUID_SUB!r} — already reverted or changed)",
+                f"{UUID_KEY} (fields changed since migration — legitimate post-migration write?)",
+                f"{LEGACY_KEY} (already exists — another process restored it?)",
+                f"{CODE_KEY} (fields changed since migration — claimed or retired?)",
             ]
             failed = [
                 item_labels[i]
                 for i, r in enumerate(reasons)
                 if r.get("Code") == "ConditionalCheckFailed"
             ]
-            msg = (
-                "Rollback transaction cancelled — safety condition failed:\n  " +
-                "\n  ".join(failed) +
-                "\nInvestigate live state before attempting rollback again."
-            )
-            return {"status": "cancelled", "reason": msg, "failed_items": failed}
+            return {
+                "status": "cancelled",
+                "reason": (
+                    "Rollback refused — safety condition failed:\n  " +
+                    "\n  ".join(failed) +
+                    "\nInvestigate live state before attempting rollback."
+                ),
+                "failed_items": failed,
+            }
         return {"status": "error", "reason": f"Unexpected DynamoDB error: {e}"}
 
     print("Rollback transaction committed.")
 
-    # Post-rollback checks
+    # --- Post-rollback checks ---
     print("\nVerifying post-rollback state...")
     errors = []
 
-    legacy_after_raw = ddb.get_item(
-        TableName=table_name, Key={"id": {"S": LEGACY_KEY}}
-    ).get("Item")
-    if legacy_after_raw is None:
-        errors.append(f"FAIL: {LEGACY_KEY} not found after rollback")
+    legacy_after = _item_to_py(ddb.get_item(TableName=table_name, Key={"id": {"S": LEGACY_KEY}}).get("Item") or {})
+    if not legacy_after:
+        errors.append(f"FAIL: {LEGACY_KEY} not found")
+    elif legacy_after.get("tcu_code") != LEGACY_TCU_CODE:
+        errors.append(f"FAIL: {LEGACY_KEY}.tcu_code={legacy_after.get('tcu_code')!r}")
     else:
-        legacy_after = _item_to_py(legacy_after_raw)
-        if legacy_after.get("tcu_code") != LEGACY_TCU_CODE:
-            errors.append(
-                f"FAIL: {LEGACY_KEY}.tcu_code = {legacy_after.get('tcu_code')!r}"
-            )
-        else:
-            print(f"  OK: {LEGACY_KEY} restored with tcu_code={LEGACY_TCU_CODE!r}")
+        print(f"  OK: {LEGACY_KEY} restored with tcu_code={LEGACY_TCU_CODE!r}")
 
-    uuid_after_raw = ddb.get_item(
-        TableName=table_name, Key={"id": {"S": UUID_KEY}}
-    ).get("Item")
-    if uuid_after_raw is None:
-        errors.append(f"FAIL: {UUID_KEY} not found after rollback")
+    uuid_after = _item_to_py(ddb.get_item(TableName=table_name, Key={"id": {"S": UUID_KEY}}).get("Item") or {})
+    if not uuid_after:
+        errors.append(f"FAIL: {UUID_KEY} not found")
+    elif uuid_after.get("tcu_code") is not None:
+        errors.append(f"FAIL: {UUID_KEY} still has tcu_code after rollback")
+    elif "migrated_from_key" in uuid_after:
+        errors.append(f"FAIL: {UUID_KEY} still has migrated_from_key after rollback")
     else:
-        uuid_after = _item_to_py(uuid_after_raw)
-        if uuid_after.get("tcu_code") is not None:
-            errors.append(
-                f"FAIL: {UUID_KEY} still has tcu_code={uuid_after.get('tcu_code')!r} after rollback"
-            )
-        elif "migrated_from_key" in uuid_after:
-            errors.append(
-                f"FAIL: {UUID_KEY} still has migrated_from_key after rollback"
-            )
-        else:
-            print(f"  OK: {UUID_KEY} restored to original stub")
+        print(f"  OK: {UUID_KEY} restored to original stub")
 
-    code_after_raw = ddb.get_item(
-        TableName=table_name, Key={"id": {"S": CODE_KEY}}
-    ).get("Item")
-    if code_after_raw is None:
-        errors.append(f"FAIL: {CODE_KEY} not found after rollback")
+    code_after = _item_to_py(ddb.get_item(TableName=table_name, Key={"id": {"S": CODE_KEY}}).get("Item") or {})
+    if not code_after:
+        errors.append(f"FAIL: {CODE_KEY} not found")
+    elif code_after.get("cognito_sub") != LEGACY_COGNITO_SUB:
+        errors.append(f"FAIL: {CODE_KEY}.cognito_sub={code_after.get('cognito_sub')!r}")
     else:
-        code_after = _item_to_py(code_after_raw)
-        if code_after.get("cognito_sub") != LEGACY_COGNITO_SUB:
-            errors.append(
-                f"FAIL: {CODE_KEY}.cognito_sub = {code_after.get('cognito_sub')!r} after rollback"
-            )
-        else:
-            print(f"  OK: {CODE_KEY}.cognito_sub restored to {LEGACY_COGNITO_SUB!r}")
+        print(f"  OK: {CODE_KEY}.cognito_sub restored to {LEGACY_COGNITO_SUB!r}")
 
     if errors:
         for e in errors:
             print(e)
-        return {
-            "status": "post_check_failed",
-            "errors": errors,
-            "note": "Rollback transaction committed but post-checks failed.",
-        }
+        return {"status": "post_check_failed", "errors": errors}
 
-    print("\nRollback complete. All three items restored to original state.")
+    print("\nRollback complete.")
     return {"status": "rolled_back"}
 
 
@@ -788,23 +839,11 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--region", default="us-east-2")
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Show plan without writing anything.",
-    )
-    parser.add_argument(
-        "--rollback", action="store_true",
-        help="Restore original items from backup. Requires backup file.",
-    )
-    parser.add_argument(
-        "--backup-file", default=DEFAULT_BACKUP_FILE,
-        help=f"Path for backup JSON (default: {DEFAULT_BACKUP_FILE})",
-    )
-    parser.add_argument(
-        "--table", default=TABLE_NAME,
-        help=f"DynamoDB table name (default: {TABLE_NAME})",
-    )
+    parser.add_argument("--region",      default="us-east-2")
+    parser.add_argument("--dry-run",     action="store_true")
+    parser.add_argument("--rollback",    action="store_true")
+    parser.add_argument("--backup-file", default=DEFAULT_BACKUP_FILE)
+    parser.add_argument("--table",       default=TABLE_NAME)
     args = parser.parse_args()
 
     ddb = boto3.client("dynamodb", region_name=args.region)

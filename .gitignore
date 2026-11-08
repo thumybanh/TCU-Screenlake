@@ -11,3 +11,4 @@ local.properties
 /.idea/
 /firebase-service-account.json
 /release-notes.txt
+lambda/assign_tcu_code/backup_migrate_legacy_key.json
